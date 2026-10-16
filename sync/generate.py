@@ -68,7 +68,8 @@ MODULE_DECLARATION = re.compile(r"\bmodule\s+(?:\w+::)?(\w+)\s*\{")
 SPEC_KEYWORD = re.compile(r"\bspec\b")
 INLINE_SPEC = re.compile(r"\bspec\s*\{")
 EMPTY_INLINE_SPEC = "spec {}"
-PUBLIC_INLINE_FUN = re.compile(r"\bpublic\s+inline\s+fun\s+(\w+)")
+INVARIANT_KEYWORD = re.compile(r"\binvariant\b")
+INLINE_FUN = re.compile(r"\b(?:(public)\s*(\(\s*\w+\s*\))?\s+)?inline\s+fun\s+(\w+)")
 
 # The documented value an admin writes to a branch's genesis_hash to make the next
 # run treat the network as reset. It is never recorded as a retired genesis hash.
@@ -326,18 +327,18 @@ def gunzip(data, what):
         raise RegistryError(f"{what} is not gzipped: {error}") from error
 
 
-def code_only(source):
-    """Returns `source` with comments and string literals replaced by spaces.
+def comments_and_strings(source):
+    """Yields (kind, start, end, terminated) for each comment and string literal in `source`.
 
-    Block comments nest, as in the Move lexer.
+    `kind` is "line", "block" or "string". Block comments nest, as in the Move
+    lexer. An unterminated block comment or string ends at the end of `source`.
     """
-    out = []
     i, n = 0, len(source)
     while i < n:
         if source.startswith("//", i):
             end = source.find("\n", i)
             end = n if end == -1 else end
-            out.append(" " * (end - i))
+            yield "line", i, end, True
             i = end
         elif source.startswith("/*", i):
             depth, j = 1, i + 2
@@ -348,18 +349,25 @@ def code_only(source):
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
-            out.append(re.sub(r"[^\n]", " ", source[i:j]))
+            yield "block", i, j, depth == 0
             i = j
         elif source[i] == '"':
             j = i + 1
             while j < n and source[j] != '"':
                 j += 2 if source[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append(re.sub(r"[^\n]", " ", source[i:j]))
-            i = j
+            yield "string", i, min(j + 1, n), j < n
+            i = min(j + 1, n)
         else:
-            out.append(source[i])
             i += 1
+
+
+def code_only(source):
+    """Returns `source` with comments and string literals replaced by spaces, keeping newlines."""
+    out, last = [], 0
+    for _, start, end, _ in comments_and_strings(source):
+        out += [source[last:start], re.sub(r"[^\n]", " ", source[start:end])]
+        last = end
+    out.append(source[last:])
     return "".join(out)
 
 
@@ -386,14 +394,19 @@ def strip_specs(text, code):
     """Returns `text` with its specification blocks removed or emptied.
 
     `code` is code_only(text). A `spec { ... }` statement in a function body,
-    the only form with no target name, is replaced by `spec {}`: the compiler
-    emits a `Nop` for each such statement, so emptying it rather than removing
-    it leaves the compiled bytecode unchanged. Every other block, which names
-    its target (`spec f { ... }`, `spec module { ... }`, `spec schema ...`,
-    `spec fun ...`, `spec native fun ...;`), is removed with the `///` doc
-    comment lines directly above it; these are not compiled into bytecode. A
-    removed block that starts a line is removed with its lines.
+    the only form with no target name, is replaced by `spec {}`, which keeps the
+    `Nop` the compiler emits for it. Every other block, which names its target
+    (`spec f { ... }`, `spec module { ... }`, `spec schema ...`, `spec fun ...`,
+    `spec native fun ...;`), is removed. A removed block that starts a line is
+    removed with the `///` doc comment lines directly above it, and with its own
+    lines unless code follows it on its last line, in which case the indentation
+    of its first line is kept.
+
+    Fails if a removed block has an attribute, which would otherwise apply to the
+    next item, or if the result holds a `spec` block, an `invariant`, or an
+    unterminated comment or string.
     """
+    line_comments = {start for kind, start, _, _ in comments_and_strings(text) if kind == "line"}
     spans = []
     for match in SPEC_KEYWORD.finditer(code):
         if spans and match.start() < spans[-1][1]:
@@ -402,24 +415,30 @@ def strip_specs(text, code):
         if INLINE_SPEC.match(code, match.start()):
             spans.append((match.start(), end, EMPTY_INLINE_SPEC))
             continue
-        start = match.start()
+        if code[:match.start()].rstrip().endswith("]"):
+            raise RegistryError("a spec block has an attribute")
+        start, replacement = match.start(), ""
         line_start = text.rfind("\n", 0, start) + 1
-        starts_line = not text[line_start:start].strip()
-        if starts_line:
+        if not text[line_start:start].strip():
             start = line_start
             while start > 0:
                 previous = text.rfind("\n", 0, start - 1) + 1
-                if not text[previous:start].lstrip().startswith("///"):
+                line = text[previous:start]
+                doc = previous + len(line) - len(line.lstrip())
+                if not (text.startswith("///", doc) and doc in line_comments):
                     break
                 start = previous
-        if starts_line:
             line_end = text.find("\n", end)
             line_end = len(text) if line_end == -1 else line_end + 1
-            if not text[end:line_end].strip():
+            rest = text[end:line_end]
+            if rest.strip():
+                replacement = text[line_start:match.start()]
+                end += len(rest) - len(rest.lstrip(" \t"))
+            else:
                 end = line_end
         if spans:
             start = max(start, spans[-1][1])
-        spans.append((start, end, ""))
+        spans.append((start, end, replacement))
     out, last = [], 0
     for start, end, replacement in spans:
         out += [text[last:start], replacement]
@@ -429,26 +448,70 @@ def strip_specs(text, code):
     remaining = code_only(stripped)
     if len(SPEC_KEYWORD.findall(remaining)) != remaining.count(EMPTY_INLINE_SPEC):
         raise RegistryError("a spec block remains after removing spec blocks")
+    if INVARIANT_KEYWORD.search(remaining):
+        raise RegistryError("an invariant remains after removing spec blocks")
+    if not all(terminated for _, _, _, terminated in comments_and_strings(stripped)):
+        raise RegistryError("a comment or string is unterminated after removing spec blocks")
     return stripped
 
 
-def check_public_inline_functions(code, where):
-    """Fails if a `public inline fun` body holds a non-empty `spec { ... }` statement.
+def holds_spec_statement(body):
+    """Returns whether `body`, a code_only() function body, holds a non-empty `spec { ... }` statement."""
+    for statement in INLINE_SPEC.finditer(body):
+        block_end = spec_block_end(body, statement.start() + len("spec"))
+        if body[statement.end():block_end - 1].strip():
+            return True
+    return False
 
-    A dependent package compiles a public inline function into its own bytecode.
-    Which locals a spec statement reads decides whether the compiler copies or
-    moves them, so emptying the statement in such a body could change the
-    bytecode of packages that call it.
+
+def inline_functions(code):
+    """Returns (name, public, body) for each inline function in `code`, a code_only() result.
+
+    `public` is true for a `public inline fun`, which dependent packages can call.
     """
-    for match in PUBLIC_INLINE_FUN.finditer(code):
+    functions = []
+    for match in INLINE_FUN.finditer(code):
         body = code.find("{", match.end())
         if body == -1:
             continue
-        body_end = spec_block_end(code, body)
-        for statement in INLINE_SPEC.finditer(code, body, body_end):
-            block_end = spec_block_end(code, statement.start() + len("spec"))
-            if code[statement.end():block_end - 1].strip():
-                raise RegistryError(f"{where}: public inline function {match.group(1)} holds a spec statement")
+        public = bool(match.group(1)) and not match.group(2)
+        functions.append((match.group(3), public, code[body:spec_block_end(code, body)]))
+    return functions
+
+
+def check_inline_functions(functions):
+    """Fails if a `public inline fun` reaches a non-empty `spec { ... }` statement.
+
+    `functions` is (where, name, public, body) for each inline function in the
+    framework. A dependent package compiles a public inline function, and each
+    inline function it calls, directly or through other inline functions, into
+    its own bytecode. Which locals a spec statement reads decides whether the
+    compiler copies or moves them, so emptying the statement in such a body could
+    change the bytecode of packages that call it. A call is matched by the
+    function's name alone, so a call to any function of that name counts.
+    """
+    reaching = {}
+    for where, name, _, body in functions:
+        if holds_spec_statement(body):
+            reaching[(where, name)] = f"{where}::{name}"
+    changed = True
+    while changed:
+        changed = False
+        for where, name, _, body in functions:
+            if (where, name) in reaching:
+                continue
+            for (_, called), holder in list(reaching.items()):
+                if re.search(r"\b" + re.escape(called) + r"\s*(?:<[^;{}]*>\s*)?\(", body):
+                    reaching[(where, name)] = holder
+                    changed = True
+                    break
+    for where, name, public, _ in functions:
+        holder = reaching.get((where, name))
+        if not public or holder is None:
+            continue
+        if holder == f"{where}::{name}":
+            raise RegistryError(f"{where}: public inline function {name} holds a spec statement")
+        raise RegistryError(f"{where}: public inline function {name} calls inline functions that reach a spec statement in {holder}")
 
 
 def test_only_friends(code):
@@ -511,7 +574,7 @@ def package_contents(packages):
     blocks, and `code` is code_only() of the source as stored. `declared` is the
     set of modules the files declare.
     """
-    result = {}
+    result, inline = {}, []
     for name, _ in PACKAGES:
         package = packages[name]
         if not SOURCE_DIGEST.fullmatch(package["source_digest"]):
@@ -539,7 +602,7 @@ def package_contents(packages):
                 except UnicodeDecodeError as error:
                     raise RegistryError(f"{name}::{module_name} source is not UTF-8") from error
                 code = code_only(text)
-                check_public_inline_functions(code, f"{name}::{module_name}")
+                inline += [(f"{name}::{module_name}", *function) for function in inline_functions(code)]
                 by_source[source] = code
                 files[module_name] = (strip_specs(text, code).encode("utf-8"), code)
                 declared |= declared_modules(code)
@@ -548,6 +611,7 @@ def package_contents(packages):
         if not files:
             raise RegistryError(f"{name} has no modules")
         result[name] = (manifest, files, declared)
+    check_inline_functions(inline)
     return result
 
 

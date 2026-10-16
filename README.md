@@ -48,7 +48,7 @@ curl -s -H 'Accept: application/x-bcs' \
 
 The registry includes each package's `upgrade_number`, which increases with every upgrade of that package, so every framework upgrade produces a new tag, including one that deploys source the network ran before. A network reset that recreates a registry byte for byte reuses the existing tag, which points at the commit generated before the reset.
 
-A tag points at the first commit generated from its registry state and is never moved. A later commit generated from the same registry state, after a change to the generator, can differ in the generated files listed below, and carries no new tag. `registry.json` records the full SHA-256 of the registry each commit was generated from.
+A tag points at the first commit generated from its registry state and is never moved. A later commit generated from the same registry state, after a change to the generator, can differ in its module sources and in its generated files, both described below, and carries no new tag. `registry.json` records the full SHA-256 of the registry each commit was generated from.
 
 To build against a fixed version of the framework, use a tag as `rev`:
 
@@ -60,12 +60,14 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 
 Each package directory holds `Move.toml` and `sources/`. Every `Move.toml` is byte-identical to the on-chain registry. Every module source is the on-chain source with its specifications removed:
 
-- every `spec ... { ... }` block that names its target (a function, struct, `module`, `schema`, `fun` or `native fun`) is removed, with any `///` doc comment directly above it;
+- every `spec ... { ... }` block that names its target (a function, struct, `module`, `schema`, `fun` or `native fun`) is removed, with any `///` doc comment directly above it. Where code or a comment follows the block on its line, the line's indentation is kept;
 - every `spec { ... }` statement in a function body is emptied to `spec {}`.
+
+The generator fails if a removed block has an attribute, or if the result still holds a specification construct, such as a module-level `invariant`.
 
 The on-chain sources call specification functions and variables defined in the framework's `.spec.move` files, which are not stored on chain; without those definitions the specifications do not compile.
 
-A package that depends on a network branch compiles to the same bytecode as it would against the framework's original sources. Specification blocks are not compiled into bytecode. A `spec` statement in a function body compiles to a `Nop`, which `spec {}` keeps, but the locals it reads can decide whether the compiler copies or moves them. Emptying it can therefore change the framework's own bytecode: on Mainnet on 2026-10-16, compiled as the root package, `randomness`, `stake` and `storage_gas` differed from a build of the original sources in that way. That bytecode is not part of a dependent package. The only framework code a dependent package compiles into its own bytecode is the `public inline fun`s it calls, and the generator fails if a `public inline fun` holds a non-empty `spec` statement.
+A package that depends on a network branch compiles to the same bytecode as it would against the framework's original sources. Specification blocks are not compiled into bytecode. A `spec` statement in a function body compiles to a `Nop`, which `spec {}` keeps, but the locals it reads can decide whether the compiler copies or moves them. Emptying it can therefore change the framework's own bytecode: on Mainnet on 2026-10-16, compiled as the root package, `randomness`, `stake` and `storage_gas` differed from a build of the original sources in that way. That bytecode is not part of a dependent package. The only framework code a dependent package compiles into its own bytecode is the `public inline fun`s it calls and the inline functions those call, directly or through other inline functions. The generator fails if a `public inline fun` holds a non-empty `spec` statement or calls an inline function that holds or reaches one.
 
 The registry stores each module's whole source file, so modules published from one file share it, and it is written once, named after the first of them. The following files are not on chain and are generated:
 

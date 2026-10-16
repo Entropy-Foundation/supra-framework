@@ -903,6 +903,76 @@ class StripSpecsTest(unittest.TestCase):
             with open(os.path.join(out, "move-stdlib", "sources", "m.move")) as file:
                 self.assertIn("    inline fun f(x: u64): u64 {\n        spec {};\n", file.read())
 
+    def generate_error(self, overrides):
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.generate("mainnet", registry(packages(**overrides)), 8, GENESIS, [], out)
+        return str(raised.exception)
+
+    def test_rejects_a_public_inline_function_reaching_a_spec_statement_through_inline_calls(self):
+        source = (
+            "module std::m {\n"
+            "    inline fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n"
+            "    inline fun middle<T>(x: u64): u64 { holder(x) }\n"
+            "    public inline fun f(x: u64): u64 { middle<u8>(x) }\n"
+            "}\n"
+        )
+        self.assertIn(
+            "MoveStdlib::m: public inline function f calls inline functions that reach a spec statement in MoveStdlib::m::holder",
+            self.generate_error({"MoveStdlib": package("MoveStdlib", {"m": source})}),
+        )
+
+    def test_rejects_a_public_inline_function_reaching_a_spec_statement_in_another_package(self):
+        holder = "module std::m {\n    public(friend) inline fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n}\n"
+        caller = "module supra_framework::c {\n    public inline fun f(x: u64): u64 { std::m::holder(x) }\n}\n"
+        self.assertIn(
+            "SupraFramework::c: public inline function f calls inline functions that reach a spec statement in MoveStdlib::m::holder",
+            self.generate_error({
+                "MoveStdlib": package("MoveStdlib", {"m": holder}),
+                "SupraFramework": package("SupraFramework", {"c": caller, "genesis": "module supra_framework::genesis {}\n"}),
+            }),
+        )
+
+    def test_accepts_a_public_inline_function_calling_a_non_inline_function_with_a_spec_statement(self):
+        source = (
+            "module std::m {\n"
+            "    fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n"
+            "    public inline fun f(x: u64): u64 { holder(x) }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(MoveStdlib=package("MoveStdlib", {"m": source}))), 8, GENESIS, [], out)
+
+    def test_rejects_an_attribute_on_a_removed_block(self):
+        for attribute in ("    #[verify_only]\n", "    #[verify_only] "):
+            with self.subTest(attribute=attribute):
+                with self.assertRaises(generate.RegistryError) as raised:
+                    strip("module std::m {\n" + attribute + "spec f {\n    }\n    fun f() {}\n}\n")
+                self.assertIn("a spec block has an attribute", str(raised.exception))
+
+    def test_rejects_a_module_level_invariant(self):
+        with self.assertRaises(generate.RegistryError) as raised:
+            strip("module std::m {\n    invariant true;\n}\n")
+        self.assertIn("an invariant remains", str(raised.exception))
+
+    def test_keeps_a_block_comment_whose_last_line_starts_with_three_slashes(self):
+        source = "module std::m {\n    /*\n    /// x */\n    spec f {\n    }\n    fun f() {}\n}\n"
+        self.assertEqual(strip(source), "module std::m {\n    /*\n    /// x */\n    fun f() {}\n}\n")
+
+    def test_keeps_indentation_when_code_follows_a_block_on_its_line(self):
+        self.assertEqual(
+            strip("module std::m {\n    /// Module.\n    spec module {} // comment\n    spec f { } fun f() {}\n}\n"),
+            "module std::m {\n    // comment\n    fun f() {}\n}\n",
+        )
+
+    def test_rejects_an_unterminated_comment_in_the_result(self):
+        source = "module std::m {\n    fun f() {}\n}\n"
+        unterminated = [("block", 0, len(source), False)]
+        with mock.patch.object(generate, "comments_and_strings", side_effect=[[], [], unterminated]):
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.strip_specs(source, source)
+        self.assertIn("unterminated", str(raised.exception))
+
     def test_generated_sources_have_no_spec_blocks(self):
         source = "module std::vector {\n    native public fun empty<T>(): vector<T>;\n    spec empty {\n        pragma intrinsic;\n    }\n}\n"
         with tempfile.TemporaryDirectory() as out:
