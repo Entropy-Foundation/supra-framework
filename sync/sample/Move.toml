@@ -1,0 +1,9 @@
+[package]
+name = "SyncSample"
+version = "0.0.1"
+
+[addresses]
+sample = "0xCAFE"
+
+[dependencies]
+SupraFramework = { local = "../tree/supra-framework" }
