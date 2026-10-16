@@ -65,6 +65,10 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SOURCE_DIGEST = re.compile(r"[0-9A-Fa-f]{64}")
 GENESIS_HASH = re.compile(r"0x[0-9a-f]{64}")
 MODULE_DECLARATION = re.compile(r"\bmodule\s+(?:\w+::)?(\w+)\s*\{")
+SPEC_KEYWORD = re.compile(r"\bspec\b")
+INLINE_SPEC = re.compile(r"\bspec\s*\{")
+EMPTY_INLINE_SPEC = "spec {}"
+PUBLIC_INLINE_FUN = re.compile(r"\bpublic\s+inline\s+fun\s+(\w+)")
 
 # The documented value an admin writes to a branch's genesis_hash to make the next
 # run treat the network as reset. It is never recorded as a retired genesis hash.
@@ -359,6 +363,94 @@ def code_only(source):
     return "".join(out)
 
 
+def spec_block_end(code, offset):
+    """Returns the offset just past the specification block whose `spec` keyword ends at `offset`.
+
+    The block ends at its matching `}`, or at `;` for a declaration without a body.
+    """
+    depth = 0
+    for index in range(offset, len(code)):
+        character = code[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        elif character == ";" and depth == 0:
+            return index + 1
+    raise RegistryError("a spec block is not terminated")
+
+
+def strip_specs(text, code):
+    """Returns `text` with its specification blocks removed or emptied.
+
+    `code` is code_only(text). A `spec { ... }` statement in a function body,
+    the only form with no target name, is replaced by `spec {}`: the compiler
+    emits a `Nop` for each such statement, so emptying it rather than removing
+    it leaves the compiled bytecode unchanged. Every other block, which names
+    its target (`spec f { ... }`, `spec module { ... }`, `spec schema ...`,
+    `spec fun ...`, `spec native fun ...;`), is removed with the `///` doc
+    comment lines directly above it; these are not compiled into bytecode. A
+    removed block that starts a line is removed with its lines.
+    """
+    spans = []
+    for match in SPEC_KEYWORD.finditer(code):
+        if spans and match.start() < spans[-1][1]:
+            continue
+        end = spec_block_end(code, match.end())
+        if INLINE_SPEC.match(code, match.start()):
+            spans.append((match.start(), end, EMPTY_INLINE_SPEC))
+            continue
+        start = match.start()
+        line_start = text.rfind("\n", 0, start) + 1
+        starts_line = not text[line_start:start].strip()
+        if starts_line:
+            start = line_start
+            while start > 0:
+                previous = text.rfind("\n", 0, start - 1) + 1
+                if not text[previous:start].lstrip().startswith("///"):
+                    break
+                start = previous
+        if starts_line:
+            line_end = text.find("\n", end)
+            line_end = len(text) if line_end == -1 else line_end + 1
+            if not text[end:line_end].strip():
+                end = line_end
+        if spans:
+            start = max(start, spans[-1][1])
+        spans.append((start, end, ""))
+    out, last = [], 0
+    for start, end, replacement in spans:
+        out += [text[last:start], replacement]
+        last = end
+    out.append(text[last:])
+    stripped = "".join(out)
+    remaining = code_only(stripped)
+    if len(SPEC_KEYWORD.findall(remaining)) != remaining.count(EMPTY_INLINE_SPEC):
+        raise RegistryError("a spec block remains after removing spec blocks")
+    return stripped
+
+
+def check_public_inline_functions(code, where):
+    """Fails if a `public inline fun` body holds a non-empty `spec { ... }` statement.
+
+    A dependent package compiles a public inline function into its own bytecode.
+    Which locals a spec statement reads decides whether the compiler copies or
+    moves them, so emptying the statement in such a body could change the
+    bytecode of packages that call it.
+    """
+    for match in PUBLIC_INLINE_FUN.finditer(code):
+        body = code.find("{", match.end())
+        if body == -1:
+            continue
+        body_end = spec_block_end(code, body)
+        for statement in INLINE_SPEC.finditer(code, body, body_end):
+            block_end = spec_block_end(code, statement.start() + len("spec"))
+            if code[statement.end():block_end - 1].strip():
+                raise RegistryError(f"{where}: public inline function {match.group(1)} holds a spec statement")
+
+
 def test_only_friends(code):
     """Returns (address, module) for each `friend` declaration with a `test_only` attribute.
 
@@ -413,9 +505,11 @@ def tag_name(network, registry_bcs):
 def package_contents(packages):
     """Returns {package name: (manifest, files, declared)} after checking each file.
 
-    `files` maps a file name to (bytes, code) for each distinct module source:
-    a module's stored source is its whole file, so modules from one file share
-    it, and it is written once. `declared` is the set of modules the files declare.
+    `files` maps a file name to (bytes to write, code) for each distinct module
+    source: a module's stored source is its whole file, so modules from one file
+    share it, and it is written once. The bytes are the source without its spec
+    blocks, and `code` is code_only() of the source as stored. `declared` is the
+    set of modules the files declare.
     """
     result = {}
     for name, _ in PACKAGES:
@@ -441,11 +535,13 @@ def package_contents(packages):
             source = gunzip(module["source"], f"{name}::{module_name} source")
             if source not in by_source:
                 try:
-                    code = code_only(source.decode("utf-8"))
+                    text = source.decode("utf-8")
                 except UnicodeDecodeError as error:
                     raise RegistryError(f"{name}::{module_name} source is not UTF-8") from error
+                code = code_only(text)
+                check_public_inline_functions(code, f"{name}::{module_name}")
                 by_source[source] = code
-                files[module_name] = (source, code)
+                files[module_name] = (strip_specs(text, code).encode("utf-8"), code)
                 declared |= declared_modules(code)
             if module_name not in declared_modules(by_source[source]):
                 raise RegistryError(f"{name}::{module_name} source does not define the module")
