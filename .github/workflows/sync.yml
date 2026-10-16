@@ -61,7 +61,19 @@ jobs:
         id: generate
         run: |
           set -euo pipefail
-          tag=$(python3 -I tool/sync/generate.py --network "$NETWORK" --out tree --message-file message.txt)
+          # The generator reads the branch head's registry.json before replacing the tree.
+          if [ -f tree/registry.json ]; then cp tree/registry.json previous.json; fi
+          rc=0
+          tag=$(python3 -I tool/sync/generate.py --network "$NETWORK" --out tree \
+            --previous previous.json --message-file message.txt) || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning::The $NETWORK registry changed between two reads; skipping this run."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           git -C tree add -A
           if git -C tree rev-parse -q --verify HEAD >/dev/null && git -C tree diff --cached --quiet; then
@@ -73,7 +85,7 @@ jobs:
           fi
 
       - name: Compile and test a dependent package
-        if: steps.generate.outputs.changed == 'true'
+        if: steps.generate.outputs.skip == 'false' && steps.generate.outputs.changed == 'true'
         run: |
           set -euo pipefail
           image="supraoracles/supra-${NETWORK}-validator-node:latest"
@@ -108,6 +120,7 @@ jobs:
 
       - name: Commit and tag
         id: commit
+        if: steps.generate.outputs.skip == 'false'
         env:
           TAG: ${{ steps.generate.outputs.tag }}
           CHANGED: ${{ steps.generate.outputs.changed }}
@@ -138,6 +151,7 @@ jobs:
           esac
 
       - name: Push
+        if: steps.generate.outputs.skip == 'false'
         env:
           TAG: ${{ steps.generate.outputs.tag }}
           CHANGED: ${{ steps.generate.outputs.changed }}
