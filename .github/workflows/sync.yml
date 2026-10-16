@@ -1,5 +1,5 @@
 # Regenerates each network branch from the network's on-chain package registry,
-# and commits and tags the branch when the registry has changed.
+# commits the branch when the tree has changed, and tags each registry state.
 name: sync
 
 on:
@@ -43,13 +43,19 @@ jobs:
           set -euo pipefail
           git init -q tree
           git -C tree remote add origin "$REPO_URL"
-          if git -C tree ls-remote --exit-code --heads origin "$NETWORK" >/dev/null; then
-            git -C tree fetch -q --depth=1 origin "refs/heads/$NETWORK:refs/remotes/origin/$NETWORK"
-            git -C tree checkout -q -b "$NETWORK" "origin/$NETWORK"
-          else
-            echo "Branch $NETWORK does not exist yet; starting it."
-            git -C tree checkout -q --orphan "$NETWORK"
-          fi
+          # ls-remote --exit-code returns 2 when nothing matches; anything else non-zero is an error.
+          rc=0; git -C tree ls-remote --exit-code --heads origin "$NETWORK" >/dev/null || rc=$?
+          case "$rc" in
+            0)
+              git -C tree fetch -q --depth=1 origin "refs/heads/$NETWORK:refs/remotes/origin/$NETWORK"
+              git -C tree checkout -q -b "$NETWORK" "origin/$NETWORK"
+              ;;
+            2)
+              echo "Branch $NETWORK does not exist yet; starting it."
+              git -C tree checkout -q --orphan "$NETWORK"
+              ;;
+            *) echo "::error::Looking up branch $NETWORK failed with exit code $rc."; exit 1 ;;
+          esac
 
       - name: Generate the tree
         id: generate
@@ -60,7 +66,7 @@ jobs:
           git -C tree add -A
           if git -C tree rev-parse -q --verify HEAD >/dev/null && git -C tree diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "The $NETWORK registry is unchanged ($tag)."
+            echo "The $NETWORK tree is unchanged ($tag)."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git -C tree diff --cached --stat | tail -n 1
@@ -76,9 +82,13 @@ jobs:
             aarch64) arch=arm64 ;;
             *) echo "::error::Unsupported runner architecture $(uname -m)"; exit 1 ;;
           esac
-          if ! docker manifest inspect -v "$image" > manifest.json 2>/dev/null; then
-            echo "::notice::$image does not exist; skipping the compile check for $NETWORK."
-            exit 0
+          if ! docker manifest inspect -v "$image" > manifest.json 2> manifest.err; then
+            if grep -q '^no such manifest:' manifest.err; then
+              echo "::notice::$image does not exist; skipping the compile check for $NETWORK."
+              exit 0
+            fi
+            echo "::error::Inspecting $image failed: $(head -c 500 manifest.err)"
+            exit 1
           fi
           if ! python3 -I -c '
           import json, sys
@@ -97,6 +107,7 @@ jobs:
             move tool test --package-dir /work/sample --skip-fetch-latest-git-deps
 
       - name: Commit and tag
+        id: commit
         env:
           TAG: ${{ steps.generate.outputs.tag }}
           CHANGED: ${{ steps.generate.outputs.changed }}
@@ -105,29 +116,41 @@ jobs:
           if [ "$CHANGED" = "true" ]; then
             git -C tree commit -q -F ../message.txt
           fi
-          if git -C tree ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            git -C tree fetch -q --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
-            if [ "$(git -C tree rev-parse "$TAG^{tree}")" != "$(git -C tree rev-parse "HEAD^{tree}")" ]; then
-              echo "::error::Tag $TAG exists and names a different tree."
-              exit 1
-            fi
-            echo "push_tag=false" >> "$GITHUB_ENV"
-          else
-            git -C tree tag -a "$TAG" -F ../message.txt
-            echo "push_tag=true" >> "$GITHUB_ENV"
-          fi
+          # A tag names a registry state. A later commit generated from the same
+          # registry can differ in the generated files, and leaves the tag in place.
+          rc=0; git -C tree ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null || rc=$?
+          case "$rc" in
+            0)
+              git -C tree fetch -q --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
+              tagged=$(git -C tree show "$TAG:registry.json" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["registry_sha256"])')
+              current=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["registry_sha256"])' tree/registry.json)
+              if [ "$tagged" != "$current" ]; then
+                echo "::error::Tag $TAG names registry $tagged, but this tree was generated from registry $current."
+                exit 1
+              fi
+              echo "push_tag=false" >> "$GITHUB_OUTPUT"
+              ;;
+            2)
+              git -C tree tag -a "$TAG" -F ../message.txt
+              echo "push_tag=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "::error::Looking up tag $TAG failed with exit code $rc."; exit 1 ;;
+          esac
 
       - name: Push
         env:
           TAG: ${{ steps.generate.outputs.tag }}
           CHANGED: ${{ steps.generate.outputs.changed }}
+          PUSH_TAG: ${{ steps.commit.outputs.push_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          refs=()
+          if [ "$CHANGED" = "true" ]; then refs+=("HEAD:refs/heads/$NETWORK"); fi
+          if [ "$PUSH_TAG" = "true" ]; then refs+=("refs/tags/$TAG"); fi
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "Nothing to push for $NETWORK."
+            exit 0
+          fi
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          if [ "$CHANGED" = "true" ]; then
-            git -C tree -c http.extraheader="$auth" push -q origin "HEAD:refs/heads/$NETWORK"
-          fi
-          if [ "$push_tag" = "true" ]; then
-            git -C tree -c http.extraheader="$auth" push -q origin "refs/tags/$TAG"
-          fi
+          git -C tree -c http.extraheader="$auth" push -q --atomic origin "${refs[@]}"

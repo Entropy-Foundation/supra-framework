@@ -21,20 +21,27 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 | `testnet` | Testnet | 6 |
 | `devnet` | Devnet | 50 |
 
-A scheduled workflow reads each network's registry every hour. When the registry changes, the workflow commits the new source to that network's branch and tags the commit.
+A scheduled workflow reads each network's registry every hour and regenerates that network's branch. When the generated files change, the workflow commits them to the branch, and it tags each registry state it has not seen before.
 
 `main` holds this README and the workflow that generates the network branches.
 
 ## Tags
 
-Each commit on a network branch is tagged `<network>-<hash>`, for example `mainnet-6cf4ea6656ed`. `<hash>` is the first 12 hex characters of the SHA-256 of the four packages' on-chain `source_digest`s, concatenated in the order `MoveStdlib`, `AptosStdlib`, `SupraStdlib`, `SupraFramework`.
+Each registry state is tagged `<network>-<hash>`, for example `mainnet-0f0b6eac260e`. `<hash>` is the first 12 hex characters of the SHA-256 of the registry's BCS encoding, as the network's RPC returns it:
 
-A tag always names the same source. If a network returns to source it ran before, for example after a reset, the existing tag is reused.
+```sh
+curl -s -H 'Accept: application/x-bcs' \
+  'https://rpc-mainnet.supra.com/rpc/v3/accounts/0x1/resources/0x1::code::PackageRegistry' | sha256sum
+```
+
+The registry includes each package's `upgrade_number`, which increases with every upgrade of that package, so every framework upgrade produces a new tag, including one that deploys source the network ran before. A network reset that recreates a registry byte for byte reuses the existing tag.
+
+A tag points at the first commit generated from its registry state and is never moved. A later commit generated from the same registry state, after a change to the generator, can differ in the generated files listed below, and carries no new tag. `registry.json` records the full SHA-256 of the registry each commit was generated from.
 
 To build against a fixed version of the framework, use a tag as `rev`:
 
 ```toml
-SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.git", rev = "mainnet-6cf4ea6656ed", subdir = "supra-framework" }
+SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.git", rev = "mainnet-0f0b6eac260e", subdir = "supra-framework" }
 ```
 
 ## Contents of a network branch
@@ -43,7 +50,7 @@ Each package directory holds `Move.toml` and `sources/`. Every module source and
 
 - `move-stdlib/sources/unit_test.move`: the `#[test_only]` module `std::unit_test`, which `supra move tool test` requires. Test-only modules are not published.
 - An empty `#[test_only]` module for each `#[test_only] friend` declaration in the framework that names a module not on chain. Each one carries a comment stating that it is generated.
-- `registry.json`: the network, its chain ID, and each package's `upgrade_number` and `source_digest`.
+- `registry.json`: the network, its chain ID, the SHA-256 of the registry's BCS encoding, and each package's `upgrade_number` and `source_digest`.
 - `README.md`: a description of the branch.
 
 The branches do not contain the framework's own tests, its `.spec.move` specification files or its generated documentation, because these are not stored on chain. Packages that depend on the framework compile and test without them. Compiling the framework as the root package, or running the Move Prover on it, needs the `.spec.move` files.
