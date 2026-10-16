@@ -131,18 +131,3 @@ jobs:
           if [ "$push_tag" = "true" ]; then
             git -C tree -c http.extraheader="$auth" push -q origin "refs/tags/$TAG"
           fi
-
-  # GitHub disables scheduled workflows in a public repository after 60 days
-  # without repository activity, and a network's framework can stay unchanged
-  # for longer than that.
-  keepalive:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Re-enable this workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync.yml/enable"
