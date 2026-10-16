@@ -1,0 +1,148 @@
+# Regenerates each network branch from the network's on-chain package registry,
+# and commits and tags the branch when the registry has changed.
+name: sync
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: sync (${{ matrix.network }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [mainnet, testnet, devnet]
+    concurrency:
+      group: sync-${{ matrix.network }}
+      cancel-in-progress: false
+    env:
+      NETWORK: ${{ matrix.network }}
+      REPO_URL: https://github.com/${{ github.repository }}.git
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - name: Check out the generator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: tool
+          persist-credentials: false
+
+      - name: Check out the network branch
+        run: |
+          set -euo pipefail
+          git init -q tree
+          git -C tree remote add origin "$REPO_URL"
+          if git -C tree ls-remote --exit-code --heads origin "$NETWORK" >/dev/null; then
+            git -C tree fetch -q --depth=1 origin "refs/heads/$NETWORK:refs/remotes/origin/$NETWORK"
+            git -C tree checkout -q -b "$NETWORK" "origin/$NETWORK"
+          else
+            echo "Branch $NETWORK does not exist yet; starting it."
+            git -C tree checkout -q --orphan "$NETWORK"
+          fi
+
+      - name: Generate the tree
+        id: generate
+        run: |
+          set -euo pipefail
+          tag=$(python3 -I tool/sync/generate.py --network "$NETWORK" --out tree --message-file message.txt)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git -C tree add -A
+          if git -C tree rev-parse -q --verify HEAD >/dev/null && git -C tree diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The $NETWORK registry is unchanged ($tag)."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git -C tree diff --cached --stat | tail -n 1
+          fi
+
+      - name: Compile and test a dependent package
+        if: steps.generate.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          image="supraoracles/supra-${NETWORK}-validator-node:latest"
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64) arch=arm64 ;;
+            *) echo "::error::Unsupported runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          if ! docker manifest inspect -v "$image" > manifest.json 2>/dev/null; then
+            echo "::notice::$image does not exist; skipping the compile check for $NETWORK."
+            exit 0
+          fi
+          if ! python3 -I -c '
+          import json, sys
+          data = json.load(open("manifest.json"))
+          items = data if isinstance(data, list) else [data]
+          platforms = [i.get("Descriptor", {}).get("platform") or {} for i in items]
+          sys.exit(0 if any(p.get("os") == "linux" and p.get("architecture") == sys.argv[1] for p in platforms) else 1)
+          ' "$arch"; then
+            echo "::notice::$image has no linux/$arch image; skipping the compile check for $NETWORK."
+            exit 0
+          fi
+          cp -R tool/sync/sample sample
+          docker run --rm --network none --platform "linux/$arch" \
+            -v "$PWD/tree:/work/tree:ro" -v "$PWD/sample:/work/sample" -e HOME=/tmp \
+            --entrypoint /supra/supra "$image" \
+            move tool test --package-dir /work/sample --skip-fetch-latest-git-deps
+
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.generate.outputs.tag }}
+          CHANGED: ${{ steps.generate.outputs.changed }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" = "true" ]; then
+            git -C tree commit -q -F ../message.txt
+          fi
+          if git -C tree ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            git -C tree fetch -q --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
+            if [ "$(git -C tree rev-parse "$TAG^{tree}")" != "$(git -C tree rev-parse "HEAD^{tree}")" ]; then
+              echo "::error::Tag $TAG exists and names a different tree."
+              exit 1
+            fi
+            echo "push_tag=false" >> "$GITHUB_ENV"
+          else
+            git -C tree tag -a "$TAG" -F ../message.txt
+            echo "push_tag=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Push
+        env:
+          TAG: ${{ steps.generate.outputs.tag }}
+          CHANGED: ${{ steps.generate.outputs.changed }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if [ "$CHANGED" = "true" ]; then
+            git -C tree -c http.extraheader="$auth" push -q origin "HEAD:refs/heads/$NETWORK"
+          fi
+          if [ "$push_tag" = "true" ]; then
+            git -C tree -c http.extraheader="$auth" push -q origin "refs/tags/$TAG"
+          fi
+
+  # GitHub disables scheduled workflows in a public repository after 60 days
+  # without repository activity, and a network's framework can stay unchanged
+  # for longer than that.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync.yml/enable"

@@ -44,6 +44,7 @@ Each package directory holds `Move.toml` and `sources/`. Every module source and
 - `move-stdlib/sources/unit_test.move`: the `#[test_only]` module `std::unit_test`, which `supra move tool test` requires. Test-only modules are not published.
 - An empty `#[test_only]` module for each `#[test_only] friend` declaration in the framework that names a module not on chain. Each one carries a comment stating that it is generated.
 - `registry.json`: the network, its chain ID, and each package's `upgrade_number` and `source_digest`.
+- `README.md`: a description of the branch.
 
 The branches do not contain the framework's own tests, its `.spec.move` specification files or its generated documentation, because these are not stored on chain. Packages that depend on the framework compile and test without them. Compiling the framework as the root package, or running the Move Prover on it, needs the `.spec.move` files.
 
