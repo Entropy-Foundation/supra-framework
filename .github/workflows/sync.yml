@@ -136,13 +136,11 @@ jobs:
           case "$rc" in
             0)
               git -C tree fetch -q --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
-              read_sha='import json, sys
-          try:
-              print(json.load(sys.stdin).get("registry_sha256", "missing"))
-          except ValueError:
-              print("unreadable")'
-              tagged=$(git -C tree show "$TAG:registry.json" 2>/dev/null | python3 -I -c "$read_sha" || echo "absent")
-              current=$(python3 -I -c "$read_sha" < tree/registry.json)
+              tagged="no registry.json"
+              if git -C tree show "$TAG:registry.json" > tagged.json 2>/dev/null; then
+                tagged=$(python3 -I tool/sync/generate.py --registry-sha256 tagged.json) || tagged="no registry_sha256"
+              fi
+              current=$(python3 -I tool/sync/generate.py --registry-sha256 tree/registry.json)
               if [ "$tagged" != "$current" ]; then
                 echo "::error::Tag $TAG names registry $tagged, but this tree was generated from registry $current."
                 exit 1

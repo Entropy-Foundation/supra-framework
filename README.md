@@ -35,7 +35,7 @@ While the genesis hash is unchanged, a package's `upgrade_number` never decrease
 
 When the genesis hash on `devnet` changes, the workflow treats it as a reset and commits the reset network's framework on top of the branch's history; the commit message records both genesis hashes, and `registry.json` adds the previous one to `retired_genesis_hashes`. A change to a retired genesis hash fails the run, as does a changed genesis hash on `mainnet` or `testnet`.
 
-A reset whose genesis configuration is byte-identical to the previous one, including its genesis timestamp, has the same genesis hash and is not detected. If its registry is older than the branch, every run fails. To resume, commit a change to `devnet`'s `registry.json` that sets `genesis_hash` to another value of the same form, such as `0x` followed by 64 zeros; the next run then treats the network as reset.
+A reset whose genesis configuration is byte-identical to the previous one, including its genesis timestamp, has the same genesis hash and is not detected. If its registry is older than the branch, every run fails. To resume, commit a change to `devnet`'s `registry.json` that sets `genesis_hash` to `0x` followed by 64 zeros. The next run treats the network as reset, does not add that value to `retired_genesis_hashes`, and says in its commit message that the branch was marked for reset.
 
 ## Tags
 
@@ -58,7 +58,7 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 
 ## Contents of a network branch
 
-Each package directory holds `Move.toml` and `sources/`. Every module source and every `Move.toml` is byte-identical to the on-chain registry. The following files are not on chain and are generated:
+Each package directory holds `Move.toml` and `sources/`. Every module source and every `Move.toml` is byte-identical to the on-chain registry. The registry stores each module's whole source file, so modules published from one file share it, and it is written once, named after the first of them. The following files are not on chain and are generated:
 
 - `move-stdlib/sources/unit_test.move`: the `#[test_only]` module `std::unit_test`, which `supra move tool test` requires. Test-only modules are not published.
 - An empty `#[test_only]` module at `0x1` for each `#[test_only] friend` declaration in the framework that names a module not on chain, written once, in the first package in dependency order whose sources name it. Each one carries a comment stating that it is generated.

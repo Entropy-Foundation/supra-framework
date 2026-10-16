@@ -25,6 +25,7 @@ import re
 import shutil
 import sys
 import time
+import urllib.error
 import urllib.request
 
 NETWORKS = {
@@ -63,6 +64,11 @@ UNIT_TEST_MODULE = "unit_test"
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SOURCE_DIGEST = re.compile(r"[0-9A-Fa-f]{64}")
 GENESIS_HASH = re.compile(r"0x[0-9a-f]{64}")
+MODULE_DECLARATION = re.compile(r"\bmodule\s+(?:\w+::)?(\w+)\s*\{")
+
+# The documented value an admin writes to a branch's genesis_hash to make the next
+# run treat the network as reset. It is never recorded as a retired genesis hash.
+RESET_MARKER = "0x" + "0" * 64
 FRIEND = re.compile(r"((?:#\[[^\]]*\]\s*)+)friend\s+(\w+)::(\w+)\s*;")
 ATTRIBUTE_LIST = re.compile(r"#\[([^\]]*)\]")
 
@@ -105,6 +111,10 @@ def fetch(url, accept, attempts=3, timeout=30):
                 if content_type != accept:
                     raise RegistryError(f"GET {url} returned {content_type}, expected {accept}")
                 return response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            if error.code < 500 or attempt == attempts:
+                raise RegistryError(f"GET {url} failed: {error}") from error
+            time.sleep(5 * attempt)
         except (OSError, http.client.HTTPException) as error:
             if attempt == attempts:
                 raise RegistryError(f"GET {url} failed: {error}") from error
@@ -228,10 +238,10 @@ def parse_genesis_hash(body, chain_id):
 def read_network(network, previous, fetch=fetch, sleep=time.sleep):
     """Returns (registry_bcs, chain_id, genesis_hash, packages, history) read from the network's RPC.
 
-    The history check against `previous` runs on the first read. A registry
-    whose SHA-256 differs from `previous` is then read again after
-    STABLE_READ_DELAY_SECONDS, together with the genesis hash, and
-    UnstableRegistry is raised if either differs between the two reads.
+    The history check against `previous` runs on the first read. If the
+    registry's SHA-256 or the genesis hash differs from `previous`, both are
+    then read again after STABLE_READ_DELAY_SECONDS, and UnstableRegistry is
+    raised if either differs between the two reads.
     """
     rpc, expected_chain_id = NETWORKS[network]
 
@@ -250,7 +260,12 @@ def read_network(network, previous, fetch=fetch, sleep=time.sleep):
     packages = parse_registry(registry_bcs)
     history = check_history(network, previous, genesis_hash, packages)
 
-    if previous is None or previous["registry_sha256"] != hashlib.sha256(registry_bcs).hexdigest():
+    changed = (
+        previous is None
+        or previous["registry_sha256"] != hashlib.sha256(registry_bcs).hexdigest()
+        or previous["genesis_hash"] != genesis_hash
+    )
+    if changed:
         sleep(STABLE_READ_DELAY_SECONDS)
         second, _ = fetch(rpc + REGISTRY_PATH, "application/x-bcs")
         if second != registry_bcs:
@@ -293,7 +308,7 @@ def retired_genesis_hashes(previous, history):
     if previous is None:
         return []
     retired = list(previous["retired_genesis_hashes"])
-    if history == "reset":
+    if history == "reset" and previous["genesis_hash"] != RESET_MARKER:
         retired.append(previous["genesis_hash"])
     return retired
 
@@ -344,10 +359,13 @@ def code_only(source):
     return "".join(out)
 
 
-def test_only_friends(source):
-    """Returns (address, module) for each `friend` declaration with a `test_only` attribute."""
+def test_only_friends(code):
+    """Returns (address, module) for each `friend` declaration with a `test_only` attribute.
+
+    `code` is a code_only() result.
+    """
     friends = []
-    for attributes, address, name in FRIEND.findall(code_only(source)):
+    for attributes, address, name in FRIEND.findall(code):
         names = {
             attribute.split("(")[0].strip()
             for attribute_list in ATTRIBUTE_LIST.findall(attributes)
@@ -358,9 +376,12 @@ def test_only_friends(source):
     return friends
 
 
-def defines_module(source, name):
-    """True if the source declares the module, as `module addr::name {` or `module name {`."""
-    return re.search(rf"\bmodule\s+(?:\w+::)?{name}\s*\{{", code_only(source)) is not None
+def declared_modules(code):
+    """Returns the names of the modules declared in `code`, a code_only() result.
+
+    A module is declared as `module addr::name {` or, in an address block, `module name {`.
+    """
+    return set(MODULE_DECLARATION.findall(code))
 
 
 def clear(out_dir):
@@ -390,7 +411,12 @@ def tag_name(network, registry_bcs):
 
 
 def package_contents(packages):
-    """Returns {package name: (manifest, {module name: (bytes, text)})} after checking each file."""
+    """Returns {package name: (manifest, files, declared)} after checking each file.
+
+    `files` maps a file name to (bytes, code) for each distinct module source:
+    a module's stored source is its whole file, so modules from one file share
+    it, and it is written once. `declared` is the set of modules the files declare.
+    """
     result = {}
     for name, _ in PACKAGES:
         package = packages[name]
@@ -403,29 +429,34 @@ def package_contents(packages):
             raise RegistryError(f"{name} manifest is not UTF-8") from error
         if not re.search(rf'^\s*name\s*=\s*"{name}"\s*$', manifest_text, re.MULTILINE):
             raise RegistryError(f"{name} manifest does not name the package {name}")
-        sources = {}
+        seen, files, declared = set(), {}, set()
+        by_source = {}
         for module in package["modules"]:
             module_name = module["name"]
             if not IDENTIFIER.fullmatch(module_name):
                 raise RegistryError(f"{name} has a module with an invalid name: {module_name!r}")
-            if module_name in sources:
+            if module_name in seen:
                 raise RegistryError(f"{name} has module {module_name} twice")
+            seen.add(module_name)
             source = gunzip(module["source"], f"{name}::{module_name} source")
-            try:
-                text = source.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise RegistryError(f"{name}::{module_name} source is not UTF-8") from error
-            if not defines_module(text, module_name):
+            if source not in by_source:
+                try:
+                    code = code_only(source.decode("utf-8"))
+                except UnicodeDecodeError as error:
+                    raise RegistryError(f"{name}::{module_name} source is not UTF-8") from error
+                by_source[source] = code
+                files[module_name] = (source, code)
+                declared |= declared_modules(code)
+            if module_name not in declared_modules(by_source[source]):
                 raise RegistryError(f"{name}::{module_name} source does not define the module")
-            sources[module_name] = (source, text)
-        if not sources:
+        if not files:
             raise RegistryError(f"{name} has no modules")
-        result[name] = (manifest, sources)
+        result[name] = (manifest, files, declared)
     return result
 
 
 def generate(network, registry_bcs, chain_id, genesis_hash, retired, out_dir, packages=None):
-    """Writes the tree for the registry into out_dir and returns its tag name.
+    """Writes the tree for the registry into out_dir and returns (tag name, registry.json record).
 
     `packages` is the parsed registry, if the caller has it. Every input is
     checked before out_dir is cleared.
@@ -438,14 +469,14 @@ def generate(network, registry_bcs, chain_id, genesis_hash, retired, out_dir, pa
     if packages is None:
         packages = parse_registry(registry_bcs)
     contents = package_contents(packages)
-    # All four packages publish at 0x1, so a friend in any of them is on chain.
-    on_chain = {module for _, sources in contents.values() for module in sources}
+    # All four packages publish at 0x1, so a module declared in any of them is on chain.
+    on_chain = {module for _, _, declared in contents.values() for module in declared}
     # Each stub is written once, in the first package in dependency order that
     # names it; later packages depend on that package.
     stubs = {}
     for name, _ in PACKAGES:
-        for _, text in contents[name][1].values():
-            for _, friend in test_only_friends(text):
+        for _, code in contents[name][1].values():
+            for _, friend in test_only_friends(code):
                 if friend not in on_chain:
                     stubs.setdefault(friend, name)
 
@@ -453,11 +484,11 @@ def generate(network, registry_bcs, chain_id, genesis_hash, retired, out_dir, pa
     summary = []
     for name, directory in PACKAGES:
         package = packages[name]
-        manifest, sources = contents[name]
+        manifest, files, _ = contents[name]
         root = os.path.join(out_dir, directory)
         write(os.path.join(root, "Move.toml"), manifest)
-        for module_name, (source, _) in sources.items():
-            write(os.path.join(root, "sources", f"{module_name}.move"), source)
+        for file_name, (source, _) in files.items():
+            write(os.path.join(root, "sources", f"{file_name}.move"), source)
         for friend in sorted(friend for friend, owner in stubs.items() if owner == name):
             write(os.path.join(root, "sources", f"{friend}.move"), STUB_TEMPLATE.format(name=friend))
 
@@ -486,16 +517,16 @@ def generate(network, registry_bcs, chain_id, genesis_hash, retired, out_dir, pa
         os.path.join(out_dir, "README.md"),
         BRANCH_README_TEMPLATE.format(title=network.capitalize(), chain_id=chain_id),
     )
-    return tag_name(network, registry_bcs)
+    return tag_name(network, registry_bcs), record
 
 
-def commit_message(network, tag, history, previous, out_dir):
-    with open(os.path.join(out_dir, "registry.json")) as file:
-        record = json.load(file)
-    lines = [f"{network.capitalize()} framework as deployed at 0x1 ({tag})", ""]
-    if history == "reset":
-        lines += [f"{network.capitalize()} was reset: genesis hash {previous['genesis_hash']} is now "
-                  f"{record['genesis_hash']}.", ""]
+def commit_message(network, tag, history, previous, record):
+    title = network.capitalize()
+    lines = [f"{title} framework as deployed at 0x1 ({tag})", ""]
+    if history == "reset" and previous["genesis_hash"] == RESET_MARKER:
+        lines += [f"{title} was marked for reset in registry.json; genesis hash is now {record['genesis_hash']}.", ""]
+    elif history == "reset":
+        lines += [f"{title} was reset: genesis hash {previous['genesis_hash']} is now {record['genesis_hash']}.", ""]
     lines += [f"Genesis hash: {record['genesis_hash']}", f"Registry SHA-256: {record['registry_sha256']}"]
     for package in record["packages"]:
         lines.append(
@@ -504,24 +535,38 @@ def commit_message(network, tag, history, previous, out_dir):
     return "\n".join(lines) + "\n"
 
 
-def load_previous(path):
-    """Returns the branch head's registry.json, or None if there is none, after checking its shape."""
-    if not path or not os.path.exists(path):
-        return None
+def read_record(path):
     try:
         with open(path) as file:
-            record = json.load(file)
-    except ValueError as error:
-        raise RegistryError(f"{path} is not valid JSON: {error}") from error
+            return json.load(file)
+    except (OSError, ValueError) as error:
+        raise RegistryError(f"{path} is not readable JSON: {error}") from error
+
+
+def registry_sha256_of(path):
+    """Returns the registry_sha256 recorded in a registry.json file."""
+    record = read_record(path)
+    if not isinstance(record, dict) or not isinstance(record.get("registry_sha256"), str):
+        raise RegistryError(f"{path} records no registry_sha256")
+    return record["registry_sha256"]
+
+
+def load_previous(path, network):
+    """Returns the branch head's registry.json, or None if there is none, after checking it."""
+    if not path or not os.path.exists(path):
+        return None
+    record = read_record(path)
     problem = None
     if not isinstance(record, dict):
         problem = "it is not an object"
+    elif record.get("network") != network or record.get("chain_id") != NETWORKS[network][1]:
+        problem = f"it is for network {record.get('network')!r}, chain {record.get('chain_id')!r}"
     elif not isinstance(record.get("genesis_hash"), str) or not GENESIS_HASH.fullmatch(record["genesis_hash"]):
         problem = "genesis_hash is missing or invalid"
     elif not isinstance(record.get("registry_sha256"), str):
         problem = "registry_sha256 is missing"
     elif not isinstance(record.get("retired_genesis_hashes"), list) or not all(
-        isinstance(h, str) for h in record["retired_genesis_hashes"]
+        isinstance(h, str) and GENESIS_HASH.fullmatch(h) for h in record["retired_genesis_hashes"]
     ):
         problem = "retired_genesis_hashes is missing or invalid"
     elif not isinstance(record.get("packages"), list) or not all(
@@ -537,17 +582,31 @@ def load_previous(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--network", required=True, choices=sorted(NETWORKS))
-    parser.add_argument("--out", required=True, help="directory to write the tree into")
+    parser.add_argument("--network", choices=sorted(NETWORKS))
+    parser.add_argument("--out", help="directory to write the tree into")
+    parser.add_argument(
+        "--registry-sha256",
+        metavar="REGISTRY_JSON",
+        help="print the registry_sha256 recorded in a registry.json file, and do nothing else",
+    )
     parser.add_argument("--previous", help="the branch head's registry.json; absent for a new branch")
     parser.add_argument("--registry", help="read the registry's BCS encoding from this file instead of the RPC")
     parser.add_argument("--chain-id", type=int, help="chain ID to use with --registry")
     parser.add_argument("--genesis-hash", help="genesis hash to use with --registry")
     parser.add_argument("--message-file", help="write a commit message for the tree to this file")
     args = parser.parse_args(argv)
+    if args.registry_sha256:
+        try:
+            print(registry_sha256_of(args.registry_sha256))
+        except RegistryError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if not args.network or not args.out:
+        parser.error("--network and --out are required")
 
     try:
-        previous = load_previous(args.previous)
+        previous = load_previous(args.previous, args.network)
         if args.registry:
             if args.chain_id is None or args.genesis_hash is None:
                 parser.error("--registry requires --chain-id and --genesis-hash")
@@ -559,7 +618,7 @@ def main(argv=None):
         else:
             registry_bcs, chain_id, genesis_hash, packages, history = read_network(args.network, previous)
         retired = retired_genesis_hashes(previous, history)
-        tag = generate(args.network, registry_bcs, chain_id, genesis_hash, retired, args.out, packages)
+        tag, record = generate(args.network, registry_bcs, chain_id, genesis_hash, retired, args.out, packages)
     except UnstableRegistry as error:
         print(f"warning: {args.network}: {error}; nothing written", file=sys.stderr)
         return EXIT_UNSTABLE
@@ -569,7 +628,7 @@ def main(argv=None):
     if history == "reset":
         print(f"{args.network} was reset; genesis hash is now {genesis_hash}", file=sys.stderr)
     if args.message_file:
-        write(args.message_file, commit_message(args.network, tag, history, previous, args.out))
+        write(args.message_file, commit_message(args.network, tag, history, previous, record))
     print(tag)
     return 0
 

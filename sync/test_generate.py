@@ -6,9 +6,14 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 import generate
+
+
+def generate_tag(*args, **kwargs):
+    return generate.generate(*args, **kwargs)[0]
 
 
 def uleb128(value):
@@ -162,7 +167,7 @@ class BcsTest(unittest.TestCase):
 class CodeOnlyTest(unittest.TestCase):
     def test_finds_test_only_friends_outside_comments_and_strings(self):
         self.assertEqual(
-            generate.test_only_friends(STAKE_SOURCE),
+            generate.test_only_friends(generate.code_only(STAKE_SOURCE)),
             [
                 ("supra_framework", "stake_tests"),
                 ("supra_framework", "genesis"),
@@ -263,19 +268,19 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(record["packages"][3]["source_digest"], digest("SupraFramework"))
 
     def test_output_is_deterministic(self):
-        first = generate.generate("mainnet", registry(), 8, GENESIS, [], self.out)
+        first = generate_tag("mainnet", registry(), 8, GENESIS, [], self.out)
         snapshot = {path: self.read(path) for path in self.files()}
-        second = generate.generate("mainnet", registry(), 8, GENESIS, [], self.out)
+        second = generate_tag("mainnet", registry(), 8, GENESIS, [], self.out)
         self.assertEqual(first, second)
         self.assertEqual({path: self.read(path) for path in self.files()}, snapshot)
 
     def test_tag_is_the_hash_of_the_registry_bcs(self):
         data = registry()
-        tag = generate.generate("devnet", data, 50, GENESIS, [], self.out)
+        tag = generate_tag("devnet", data, 50, GENESIS, [], self.out)
         self.assertEqual(tag, "devnet-" + hashlib.sha256(data).hexdigest()[:12])
 
     def test_tag_changes_when_only_an_upgrade_number_changes(self):
-        before = generate.generate("mainnet", registry(), 8, GENESIS, [], self.out)
+        before = generate_tag("mainnet", registry(), 8, GENESIS, [], self.out)
         redeployed = packages(
             SupraFramework=package(
                 "SupraFramework",
@@ -283,7 +288,7 @@ class GenerateTest(unittest.TestCase):
                 upgrade_number=2,
             )
         )
-        self.assertNotEqual(generate.generate("mainnet", registry(redeployed), 8, GENESIS, [], self.out), before)
+        self.assertNotEqual(generate_tag("mainnet", registry(redeployed), 8, GENESIS, [], self.out), before)
 
     def test_removes_stale_files_and_keeps_git(self):
         os.makedirs(os.path.join(self.out, ".git"))
@@ -345,8 +350,8 @@ class GenerateTest(unittest.TestCase):
 
     def test_commit_message(self):
         data = registry()
-        tag = generate.generate("mainnet", data, 8, GENESIS, [], self.out)
-        message = generate.commit_message("mainnet", tag, "new", None, self.out)
+        tag = generate_tag("mainnet", data, 8, GENESIS, [], self.out)
+        message = generate.commit_message("mainnet", tag, "new", None, json.loads(self.read("registry.json")))
         self.assertTrue(message.startswith(f"Mainnet framework as deployed at 0x1 ({tag})\n\n"))
         self.assertIn(f"Registry SHA-256: {hashlib.sha256(data).hexdigest()}", message)
         self.assertIn(f"SupraFramework: upgrade 1, source digest {digest('SupraFramework')}", message)
@@ -376,6 +381,7 @@ def committee_body(genesis_hash=GENESIS, chain_id=8, epoch=0, version="V1"):
 def record(genesis_hash=GENESIS, upgrades=(1, 1, 1, 1), registry_sha256="0" * 64, retired=()):
     return {
         "network": "devnet",
+        "chain_id": 50,
         "genesis_hash": genesis_hash,
         "retired_genesis_hashes": list(retired),
         "registry_sha256": registry_sha256,
@@ -447,21 +453,21 @@ class AttributeTest(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(
-            generate.test_only_friends(source),
+            generate.test_only_friends(generate.code_only(source)),
             [("supra_framework", "first"), ("supra_framework", "second")],
         )
 
 
 class DefinesModuleTest(unittest.TestCase):
     def test_accepted_forms(self):
-        self.assertTrue(generate.defines_module("module supra_framework::x {\n}\n", "x"))
-        self.assertTrue(generate.defines_module("#[deprecated] module supra_framework::x {}\n", "x"))
-        self.assertTrue(generate.defines_module("address 0x1 {\nmodule x {\n}\n}\n", "x"))
+        self.assertTrue("x" in generate.declared_modules(generate.code_only("module supra_framework::x {\n}\n")))
+        self.assertTrue("x" in generate.declared_modules(generate.code_only("#[deprecated] module supra_framework::x {}\n")))
+        self.assertTrue("x" in generate.declared_modules(generate.code_only("address 0x1 {\nmodule x {\n}\n}\n")))
 
     def test_rejected_forms(self):
-        self.assertFalse(generate.defines_module("module supra_framework::xy {}\n", "x"))
-        self.assertFalse(generate.defines_module("module supra_framework::y { use supra_framework::x; }\n", "x"))
-        self.assertFalse(generate.defines_module("/* module supra_framework::x {} */ module a::y {}\n", "x"))
+        self.assertFalse("x" in generate.declared_modules(generate.code_only("module supra_framework::xy {}\n")))
+        self.assertFalse("x" in generate.declared_modules(generate.code_only("module supra_framework::y { use supra_framework::x; }\n")))
+        self.assertFalse("x" in generate.declared_modules(generate.code_only("/* module supra_framework::x {} */ module a::y {}\n")))
 
 
 class GenesisHashTest(unittest.TestCase):
@@ -606,21 +612,23 @@ class LoadPreviousTest(unittest.TestCase):
             path = os.path.join(tmp, "registry.json")
             with open(path, "w") as file:
                 file.write(value if isinstance(value, str) else json.dumps(value))
-            return generate.load_previous(path)
+            return generate.load_previous(path, "devnet")
 
     def test_missing_file_is_a_new_branch(self):
-        self.assertIsNone(generate.load_previous("/nonexistent/registry.json"))
+        self.assertIsNone(generate.load_previous("/nonexistent/registry.json", "devnet"))
 
     def test_valid_record(self):
         self.assertEqual(self.load(record())["genesis_hash"], GENESIS)
 
     def test_rejects_malformed_records(self):
         cases = {
-            "not valid JSON": "{",
+            "not readable JSON": "{",
+            "it is for network 'mainnet'": dict(record(), network="mainnet", chain_id=8),
+            "retired_genesis_hashes": dict(record(), retired=None, retired_genesis_hashes=["0x12"]),
             "not an object": [],
             "genesis_hash is missing": {k: v for k, v in record().items() if k != "genesis_hash"},
             "registry_sha256 is missing": {k: v for k, v in record().items() if k != "registry_sha256"},
-            "retired_genesis_hashes": {k: v for k, v in record().items() if k != "retired_genesis_hashes"},
+            "retired_genesis_hashes is missing": {k: v for k, v in record().items() if k != "retired_genesis_hashes"},
             "packages is missing": dict(record(), packages=[{"name": "MoveStdlib", "upgrade_number": 1}]),
         }
         for message, value in cases.items():
@@ -652,7 +660,7 @@ class MainTest(unittest.TestCase):
             with open(path, "wb") as file:
                 file.write(registry())
             with open(previous, "w") as file:
-                json.dump(record(upgrades=(1, 1, 1, 9)), file)
+                json.dump(dict(record(upgrades=(1, 1, 1, 9)), network="mainnet", chain_id=8), file)
             os.makedirs(out)
             with open(os.path.join(out, "kept"), "w") as file:
                 file.write("kept\n")
@@ -683,6 +691,119 @@ class MainTest(unittest.TestCase):
                 written = json.load(file)
             self.assertEqual(written["genesis_hash"], GENESIS)
             self.assertEqual(written["retired_genesis_hashes"], ["0x" + "cd" * 32])
+
+
+class SharedSourceTest(unittest.TestCase):
+    def test_modules_from_one_file_are_written_once(self):
+        shared = "module supra_framework::a {}\nmodule supra_framework::b {}\n"
+        framework = package(
+            "SupraFramework", {"a": shared, "b": shared, "genesis": "module supra_framework::genesis {}\n"}
+        )
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(SupraFramework=framework)), 8, GENESIS, [], out)
+            names = sorted(os.listdir(os.path.join(out, "supra-framework", "sources")))
+            self.assertEqual(names, ["a.move", "genesis.move"])
+
+    def test_a_test_only_module_in_a_published_file_is_not_stubbed(self):
+        source = (
+            "module supra_framework::a {\n    #[test_only]\n    friend supra_framework::a_tests;\n}\n"
+            "#[test_only]\nmodule supra_framework::a_tests {}\n"
+        )
+        framework = package("SupraFramework", {"a": source, "genesis": "module supra_framework::genesis {}\n"})
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(SupraFramework=framework)), 8, GENESIS, [], out)
+            self.assertFalse(os.path.exists(os.path.join(out, "supra-framework", "sources", "a_tests.move")))
+
+    def test_rejects_a_shared_file_that_does_not_declare_every_module(self):
+        shared = "module supra_framework::a {}\n"
+        framework = package("SupraFramework", {"a": shared, "b": shared})
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.generate("mainnet", registry(packages(SupraFramework=framework)), 8, GENESIS, [], out)
+        self.assertIn("SupraFramework::b source does not define the module", str(raised.exception))
+
+
+class ResetMarkerTest(unittest.TestCase):
+    def test_marker_is_not_retired(self):
+        previous = record(genesis_hash=generate.RESET_MARKER, retired=["0x" + "ef" * 32])
+        self.assertEqual(generate.check_history("devnet", previous, GENESIS, upgrades(0, 0, 0, 0)), "reset")
+        self.assertEqual(generate.retired_genesis_hashes(previous, "reset"), ["0x" + "ef" * 32])
+
+    def test_marker_commit_message(self):
+        with tempfile.TemporaryDirectory() as out:
+            tag, written = generate.generate("devnet", registry(), 50, GENESIS, [], out)
+        message = generate.commit_message("devnet", tag, "reset", record(genesis_hash=generate.RESET_MARKER), written)
+        self.assertIn(f"Devnet was marked for reset in registry.json; genesis hash is now {GENESIS}.", message)
+        self.assertNotIn("0x" + "0" * 64 + " is now", message)
+
+
+class GenesisChangeReadTest(unittest.TestCase):
+    def test_changed_genesis_hash_with_an_unchanged_registry_is_read_twice(self):
+        data = registry()
+        calls, sleeps = [], []
+        new_genesis = "0x" + "cd" * 32
+
+        def fetch(url, accept):
+            calls.append(url)
+            if url.endswith(generate.GENESIS_COMMITTEE_PATH):
+                return committee_body(new_genesis, chain_id=50), {}
+            return data, {"x-supra-chain-id": "50"}
+
+        previous = record(registry_sha256=hashlib.sha256(data).hexdigest())
+        result = generate.read_network("devnet", previous, fetch, sleeps.append)
+        self.assertEqual(result[4], "reset")
+        self.assertEqual(sleeps, [generate.STABLE_READ_DELAY_SECONDS])
+        self.assertEqual(sum(url.endswith(generate.REGISTRY_PATH) for url in calls), 2)
+
+
+class RegistrySha256Test(unittest.TestCase):
+    def run_main(self, path):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = generate.main(["--registry-sha256", path])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def write(self, tmp, value):
+        path = os.path.join(tmp, "registry.json")
+        with open(path, "w") as file:
+            file.write(value if isinstance(value, str) else json.dumps(value))
+        return path
+
+    def test_prints_the_recorded_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.run_main(self.write(tmp, record(registry_sha256="ab" * 32)))[:2], (0, "ab" * 32 + "\n"))
+
+    def test_reports_a_file_without_it(self):
+        for value in ({}, [], "", "{"):
+            with tempfile.TemporaryDirectory() as tmp:
+                status, stdout, stderr = self.run_main(self.write(tmp, value))
+            self.assertEqual((status, stdout), (1, ""))
+            self.assertIn("error:", stderr)
+
+    def test_reports_a_missing_file(self):
+        status, stdout, _ = self.run_main("/nonexistent/registry.json")
+        self.assertEqual((status, stdout), (1, ""))
+
+
+class FetchRetryTest(unittest.TestCase):
+    def attempts_for(self, code):
+        attempts = []
+
+        def urlopen(request, timeout):
+            attempts.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, code, "error", {}, None)
+
+        with mock.patch.object(generate.urllib.request, "urlopen", urlopen), mock.patch.object(generate.time, "sleep"):
+            with self.assertRaises(generate.RegistryError):
+                generate.fetch("https://example.invalid/x", "application/json")
+        return len(attempts)
+
+    def test_client_errors_are_not_retried(self):
+        for code in (400, 403, 404):
+            self.assertEqual(self.attempts_for(code), 1)
+
+    def test_server_errors_are_retried(self):
+        self.assertEqual(self.attempts_for(503), 3)
 
 
 if __name__ == "__main__":
