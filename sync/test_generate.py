@@ -806,5 +806,180 @@ class FetchRetryTest(unittest.TestCase):
         self.assertEqual(self.attempts_for(503), 3)
 
 
+def strip(text):
+    return generate.strip_specs(text, generate.code_only(text))
+
+
+class StripSpecsTest(unittest.TestCase):
+    def test_removes_top_level_blocks_with_their_lines(self):
+        source = (
+            "module std::m {\n"
+            "    struct S has drop { x: u64 }\n"
+            "    spec S {\n        invariant x > 0;\n    }\n"
+            "    public fun f(): u64 { 1 }\n"
+            "    spec f {\n        aborts_if false;\n        ensures result == 1;\n    }\n"
+            "    spec module {}\n"
+            "    spec schema AbortsIf {\n        x: u64;\n        aborts_if x == 0;\n    }\n"
+            "    spec fun helper(x: u64): bool { x > 0 }\n"
+            "    spec native fun native_helper(): bool;\n"
+            "}\n"
+        )
+        self.assertEqual(
+            strip(source),
+            "module std::m {\n    struct S has drop { x: u64 }\n    public fun f(): u64 { 1 }\n}\n",
+        )
+
+    def test_empties_statements_in_function_bodies(self):
+        source = (
+            "module std::m {\n"
+            "    fun f(n: u64) {\n"
+            "        let i = 0;\n"
+            "        while ({spec {\n            invariant i <= n;\n        };\n            (i < n)}) {\n"
+            "            i = i + 1;\n"
+            "        };\n"
+            "        spec {\n            assert i == n;\n        };\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertEqual(
+            strip(source),
+            "module std::m {\n"
+            "    fun f(n: u64) {\n"
+            "        let i = 0;\n"
+            "        while ({spec {};\n            (i < n)}) {\n"
+            "            i = i + 1;\n"
+            "        };\n"
+            "        spec {};\n"
+            "    }\n"
+            "}\n",
+        )
+
+    def test_removes_doc_comments_above_a_block_only(self):
+        source = (
+            "module std::m {\n"
+            "    // Kept.\n"
+            "    /// Documents the spec.\n"
+            "    /// Second line.\n"
+            "    spec f {\n        aborts_if false;\n    }\n"
+            "    /// Documents g.\n"
+            "    fun g() {}\n"
+            "}\n"
+        )
+        self.assertEqual(
+            strip(source),
+            "module std::m {\n    // Kept.\n    /// Documents g.\n    fun g() {}\n}\n",
+        )
+
+    def test_keeps_spec_in_comments_and_strings(self):
+        source = (
+            "module std::m {\n"
+            "    // spec f { aborts_if true; }\n"
+            "    /* spec g { } */\n"
+            '    const NOTE: vector<u8> = b"spec { }";\n'
+            "}\n"
+        )
+        self.assertEqual(strip(source), source)
+
+    def test_nested_braces(self):
+        source = "module std::m {\n    spec f {\n        ensures forall i in 0..1: { true };\n    }\n    fun f() {}\n}\n"
+        self.assertEqual(strip(source), "module std::m {\n    fun f() {}\n}\n")
+
+    def test_rejects_an_unterminated_block(self):
+        with self.assertRaises(generate.RegistryError) as raised:
+            strip("module std::m {\n    spec f {\n        aborts_if false;\n")
+        self.assertIn("not terminated", str(raised.exception))
+
+    def test_rejects_a_spec_statement_in_a_public_inline_function(self):
+        source = "module std::m {\n    public inline fun f(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n}\n"
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.generate("mainnet", registry(packages(MoveStdlib=package("MoveStdlib", {"m": source}))), 8, GENESIS, [], out)
+        self.assertIn("MoveStdlib::m: public inline function f holds a spec statement", str(raised.exception))
+
+    def test_accepts_spec_statements_in_private_inline_functions(self):
+        source = "module std::m {\n    inline fun f(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n    public inline fun g(x: u64): u64 {\n        spec {};\n        x\n    }\n}\n"
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(MoveStdlib=package("MoveStdlib", {"m": source}))), 8, GENESIS, [], out)
+            with open(os.path.join(out, "move-stdlib", "sources", "m.move")) as file:
+                self.assertIn("    inline fun f(x: u64): u64 {\n        spec {};\n", file.read())
+
+    def generate_error(self, overrides):
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.generate("mainnet", registry(packages(**overrides)), 8, GENESIS, [], out)
+        return str(raised.exception)
+
+    def test_rejects_a_public_inline_function_reaching_a_spec_statement_through_inline_calls(self):
+        source = (
+            "module std::m {\n"
+            "    inline fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n"
+            "    inline fun middle<T>(x: u64): u64 { holder(x) }\n"
+            "    public inline fun f(x: u64): u64 { middle<u8>(x) }\n"
+            "}\n"
+        )
+        self.assertIn(
+            "MoveStdlib::m: public inline function f calls inline functions that reach a spec statement in MoveStdlib::m::holder",
+            self.generate_error({"MoveStdlib": package("MoveStdlib", {"m": source})}),
+        )
+
+    def test_rejects_a_public_inline_function_reaching_a_spec_statement_in_another_package(self):
+        holder = "module std::m {\n    public(friend) inline fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n}\n"
+        caller = "module supra_framework::c {\n    public inline fun f(x: u64): u64 { std::m::holder(x) }\n}\n"
+        self.assertIn(
+            "SupraFramework::c: public inline function f calls inline functions that reach a spec statement in MoveStdlib::m::holder",
+            self.generate_error({
+                "MoveStdlib": package("MoveStdlib", {"m": holder}),
+                "SupraFramework": package("SupraFramework", {"c": caller, "genesis": "module supra_framework::genesis {}\n"}),
+            }),
+        )
+
+    def test_accepts_a_public_inline_function_calling_a_non_inline_function_with_a_spec_statement(self):
+        source = (
+            "module std::m {\n"
+            "    fun holder(x: u64): u64 {\n        spec { assume x > 0; };\n        x\n    }\n"
+            "    public inline fun f(x: u64): u64 { holder(x) }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(MoveStdlib=package("MoveStdlib", {"m": source}))), 8, GENESIS, [], out)
+
+    def test_rejects_an_attribute_on_a_removed_block(self):
+        for attribute in ("    #[verify_only]\n", "    #[verify_only] "):
+            with self.subTest(attribute=attribute):
+                with self.assertRaises(generate.RegistryError) as raised:
+                    strip("module std::m {\n" + attribute + "spec f {\n    }\n    fun f() {}\n}\n")
+                self.assertIn("a spec block has an attribute", str(raised.exception))
+
+    def test_rejects_a_module_level_invariant(self):
+        with self.assertRaises(generate.RegistryError) as raised:
+            strip("module std::m {\n    invariant true;\n}\n")
+        self.assertIn("an invariant remains", str(raised.exception))
+
+    def test_keeps_a_block_comment_whose_last_line_starts_with_three_slashes(self):
+        source = "module std::m {\n    /*\n    /// x */\n    spec f {\n    }\n    fun f() {}\n}\n"
+        self.assertEqual(strip(source), "module std::m {\n    /*\n    /// x */\n    fun f() {}\n}\n")
+
+    def test_keeps_indentation_when_code_follows_a_block_on_its_line(self):
+        self.assertEqual(
+            strip("module std::m {\n    /// Module.\n    spec module {} // comment\n    spec f { } fun f() {}\n}\n"),
+            "module std::m {\n    // comment\n    fun f() {}\n}\n",
+        )
+
+    def test_rejects_an_unterminated_comment_in_the_result(self):
+        source = "module std::m {\n    fun f() {}\n}\n"
+        unterminated = [("block", 0, len(source), False)]
+        with mock.patch.object(generate, "comments_and_strings", side_effect=[[], [], unterminated]):
+            with self.assertRaises(generate.RegistryError) as raised:
+                generate.strip_specs(source, source)
+        self.assertIn("unterminated", str(raised.exception))
+
+    def test_generated_sources_have_no_spec_blocks(self):
+        source = "module std::vector {\n    native public fun empty<T>(): vector<T>;\n    spec empty {\n        pragma intrinsic;\n    }\n}\n"
+        with tempfile.TemporaryDirectory() as out:
+            generate.generate("mainnet", registry(packages(MoveStdlib=package("MoveStdlib", {"vector": source}))), 8, GENESIS, [], out)
+            with open(os.path.join(out, "move-stdlib", "sources", "vector.move")) as file:
+                self.assertEqual(file.read(), "module std::vector {\n    native public fun empty<T>(): vector<T>;\n}\n")
+
+
 if __name__ == "__main__":
     unittest.main()

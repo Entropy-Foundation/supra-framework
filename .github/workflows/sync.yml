@@ -85,7 +85,7 @@ jobs:
             git -C tree diff --cached --stat | tail -n 1
           fi
 
-      - name: Compile and test a dependent package
+      - name: Compile the framework, and compile and test a dependent package
         if: steps.generate.outputs.skip == 'false' && steps.generate.outputs.changed == 'true'
         run: |
           set -euo pipefail
@@ -113,11 +113,18 @@ jobs:
             echo "::notice::$image has no linux/$arch image; skipping the compile check for $NETWORK."
             exit 0
           fi
+          # Builds write into the package directories, so they run on a copy of the tree.
           cp -R tool/sync/sample sample
-          docker run --rm --network none --platform "linux/$arch" \
-            -v "$PWD/tree:/work/tree:ro" -v "$PWD/sample:/work/sample" -e HOME=/tmp \
-            --entrypoint /supra/supra "$image" \
-            move tool test --package-dir /work/sample --skip-fetch-latest-git-deps
+          mkdir framework
+          git -C tree archive --format=tar "$(git -C tree write-tree)" | tar -x -C framework
+          supra() {
+            docker run --rm --network none --platform "linux/$arch" \
+              -v "$PWD/framework:/work/tree" -v "$PWD/sample:/work/sample" -e HOME=/tmp \
+              --entrypoint /supra/supra "$image" "$@" --skip-fetch-latest-git-deps
+          }
+          supra move tool compile --package-dir /work/tree/supra-framework
+          supra move tool compile --package-dir /work/sample
+          supra move tool test --package-dir /work/sample
 
       - name: Commit and tag
         id: commit
