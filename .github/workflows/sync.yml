@@ -44,7 +44,8 @@ jobs:
           git init -q tree
           git -C tree remote add origin "$REPO_URL"
           # ls-remote --exit-code returns 2 when nothing matches; anything else non-zero is an error.
-          rc=0; git -C tree ls-remote --exit-code --heads origin "$NETWORK" >/dev/null || rc=$?
+          # A pattern without the refs/heads/ prefix also matches branches ending in /$NETWORK.
+          rc=0; git -C tree ls-remote --exit-code origin "refs/heads/$NETWORK" >/dev/null || rc=$?
           case "$rc" in
             0)
               git -C tree fetch -q --depth=1 origin "refs/heads/$NETWORK:refs/remotes/origin/$NETWORK"
@@ -135,8 +136,13 @@ jobs:
           case "$rc" in
             0)
               git -C tree fetch -q --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
-              tagged=$(git -C tree show "$TAG:registry.json" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["registry_sha256"])')
-              current=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["registry_sha256"])' tree/registry.json)
+              read_sha='import json, sys
+          try:
+              print(json.load(sys.stdin).get("registry_sha256", "missing"))
+          except ValueError:
+              print("unreadable")'
+              tagged=$(git -C tree show "$TAG:registry.json" 2>/dev/null | python3 -I -c "$read_sha" || echo "absent")
+              current=$(python3 -I -c "$read_sha" < tree/registry.json)
               if [ "$tagged" != "$current" ]; then
                 echo "::error::Tag $TAG names registry $tagged, but this tree was generated from registry $current."
                 exit 1
@@ -166,5 +172,7 @@ jobs:
             echo "Nothing to push for $NETWORK."
             exit 0
           fi
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          header=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$header"
+          auth="AUTHORIZATION: basic $header"
           git -C tree -c http.extraheader="$auth" push -q --atomic origin "${refs[@]}"

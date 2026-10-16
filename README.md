@@ -23,9 +23,9 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 
 A scheduled workflow reads each network's registry every hour and regenerates that network's branch. When the generated files change, the workflow commits them to the branch, and it tags each registry state it has not seen before.
 
-A framework upgrade publishes its packages in separate transactions. When the registry has changed, the workflow reads it a second time 60 seconds later and uses it only if both reads return the same bytes; otherwise it skips that run.
+A framework upgrade publishes its packages in separate transactions. When the registry has changed, the workflow reads it and the genesis hash a second time five minutes later, and uses them only if both reads return the same values; otherwise it skips that run.
 
-The workflow does not commit a registry that is older than the branch, meaning one in which no package's `upgrade_number` is higher than on the branch and at least one is lower, as served by an RPC node that has not yet applied an upgrade. That run fails, and the next run that reads an up-to-date registry continues.
+While the genesis hash is unchanged, a package's `upgrade_number` never decreases. The workflow does not commit a registry in which any package's `upgrade_number` is lower than on the branch, as served by an RPC node that has not yet applied an upgrade. That run fails, and the next run that reads an up-to-date registry continues.
 
 `main` holds this README and the workflow that generates the network branches.
 
@@ -33,9 +33,9 @@ The workflow does not commit a registry that is older than the branch, meaning o
 
 `registry.json` records the network's genesis hash: the hash that the genesis committee certifies for epoch 0, served at `/rpc/v4/consensus/committees/0`. It is the digest of the network's genesis configuration.
 
-When the genesis hash on `devnet` changes, the workflow treats it as a reset and commits the reset network's framework on top of the branch's history; the commit message records both genesis hashes. A changed genesis hash on `mainnet` or `testnet` fails the run.
+When the genesis hash on `devnet` changes, the workflow treats it as a reset and commits the reset network's framework on top of the branch's history; the commit message records both genesis hashes, and `registry.json` adds the previous one to `retired_genesis_hashes`. A change to a retired genesis hash fails the run, as does a changed genesis hash on `mainnet` or `testnet`.
 
-A reset whose genesis configuration is byte-identical to the previous one, including its genesis timestamp, has the same genesis hash and is not detected. If its registry is older than the branch, every run fails. To resume, commit a change to `devnet`'s `registry.json` that sets `genesis_hash` to any other value; the next run then treats the network as reset.
+A reset whose genesis configuration is byte-identical to the previous one, including its genesis timestamp, has the same genesis hash and is not detected. If its registry is older than the branch, every run fails. To resume, commit a change to `devnet`'s `registry.json` that sets `genesis_hash` to another value of the same form, such as `0x` followed by 64 zeros; the next run then treats the network as reset.
 
 ## Tags
 
@@ -61,8 +61,8 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 Each package directory holds `Move.toml` and `sources/`. Every module source and every `Move.toml` is byte-identical to the on-chain registry. The following files are not on chain and are generated:
 
 - `move-stdlib/sources/unit_test.move`: the `#[test_only]` module `std::unit_test`, which `supra move tool test` requires. Test-only modules are not published.
-- An empty `#[test_only]` module for each `#[test_only] friend` declaration in the framework that names a module not on chain. Each one carries a comment stating that it is generated.
-- `registry.json`: the network, its chain ID, its genesis hash, the SHA-256 of the registry's BCS encoding, and each package's `upgrade_number` and `source_digest`.
+- An empty `#[test_only]` module at `0x1` for each `#[test_only] friend` declaration in the framework that names a module not on chain, written once, in the first package in dependency order whose sources name it. Each one carries a comment stating that it is generated.
+- `registry.json`: the network, its chain ID, its genesis hash, the genesis hashes it had before earlier resets, the SHA-256 of the registry's BCS encoding, and each package's `upgrade_number` and `source_digest`.
 - `README.md`: a description of the branch.
 
 The branches do not contain the framework's own tests, its `.spec.move` specification files or its generated documentation, because these are not stored on chain. Packages that depend on the framework compile and test without them. Compiling the framework as the root package, or running the Move Prover on it, needs the `.spec.move` files.
