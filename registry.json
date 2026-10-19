@@ -1,0 +1,29 @@
+{
+  "network": "devnet",
+  "chain_id": 50,
+  "genesis_hash": "0x4c57a68fbe996694b32aadb15386651c0411f59c91bc310140197711c2b2345d",
+  "retired_genesis_hashes": [],
+  "registry_sha256": "04b73954719ed39e923a6a6a6271d901a8363415e07292ad0434a20eb14b624b",
+  "packages": [
+    {
+      "name": "MoveStdlib",
+      "upgrade_number": "0",
+      "source_digest": "77DC26B6998BEF6E1BFED909C337D4A7DCE29A037314BB19301D728B7ADD754C"
+    },
+    {
+      "name": "AptosStdlib",
+      "upgrade_number": "0",
+      "source_digest": "D9F8765E42CEE54B926A0DF6251BF587F9938BA45BC10F93A257EE61DDA14DCB"
+    },
+    {
+      "name": "SupraStdlib",
+      "upgrade_number": "0",
+      "source_digest": "321CFF2EF5DF8B696C9757536A0EE101222511274BFAAC7B384B6FD5B4E89A2B"
+    },
+    {
+      "name": "SupraFramework",
+      "upgrade_number": "0",
+      "source_digest": "259B5E4D46F1F0548C68A9E77053B2CC2A007A42656E584976A6C248E4DA4D5F"
+    }
+  ]
+}

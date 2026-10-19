@@ -1,0 +1,6031 @@
+///
+/// Validator lifecycle:
+/// 1. Prepare a validator node set up and call stake::initialize_validator
+/// 2. Once ready to deposit stake (or have funds assigned by a staking service in exchange for ownership capability),
+/// call stake::add_stake (or *_with_cap versions if called from the staking service)
+/// 3. Call stake::join_validator_set (or _with_cap version) to join the active validator set. Changes are effective in
+/// the next epoch.
+/// 4. Validate and gain rewards. The stake will automatically be locked up for a fixed duration (set by governance) and
+/// automatically renewed at expiration.
+/// 5. At any point, if the validator operator wants to update the consensus key or network/fullnode addresses, they can
+/// call stake::rotate_consensus_key and stake::update_network_and_fullnode_addresses. Similar to changes to stake, the
+/// changes to consensus key/network/fullnode addresses are only effective in the next epoch.
+/// 6. Validator can request to unlock their stake at any time. However, their stake will only become withdrawable when
+/// their current lockup expires. This can be at most as long as the fixed lockup duration.
+/// 7. After exiting, the validator can either explicitly leave the validator set by calling stake::leave_validator_set
+/// or if their stake drops below the min required, they would get removed at the end of the epoch.
+/// 8. Validator can always rejoin the validator set by going through steps 2-3 again.
+/// 9. An owner can always switch operators by calling stake::set_operator.
+/// 10. An owner can always switch designated voter by calling stake::set_designated_voter.
+module supra_framework::stake {
+    use std::error;
+    use std::features;
+    use std::option::{Self, Option};
+    use std::signer;
+    use std::vector;
+    use aptos_std::ed25519;
+    use aptos_std::math64::min;
+    use aptos_std::table::{Self, Table};
+    use supra_std::validator_public_keys::{Self, ValidatorPublicKeys};
+    use supra_framework::supra_coin::SupraCoin;
+    use supra_framework::account;
+    use supra_framework::coin::{Self, Coin, MintCapability};
+    use supra_framework::event::{Self, EventHandle};
+    use supra_framework::timestamp;
+    use supra_framework::system_addresses;
+    use supra_framework::staking_config::{Self, StakingConfig, StakingRewardsConfig};
+    use supra_framework::chain_status;
+    use supra_framework::create_signer::create_signer;
+    use std::dkg_committee;
+
+    friend supra_framework::block;
+    friend supra_framework::genesis;
+    friend supra_framework::reconfiguration;
+    friend supra_framework::reconfiguration_with_dkg;
+    friend supra_framework::transaction_fee;
+    friend supra_framework::dkg;
+    friend supra_framework::leader_ban_registry;
+    friend supra_framework::supra_dkg;
+
+    #[test_only]
+    friend supra_framework::test_leader_ban_registry;
+
+    /// Validator Config not published.
+    const EVALIDATOR_CONFIG: u64 = 1;
+    /// Not enough stake to join validator set.
+    const ESTAKE_TOO_LOW: u64 = 2;
+    /// Too much stake to join validator set.
+    const ESTAKE_TOO_HIGH: u64 = 3;
+    /// Account is already a validator or pending validator.
+    const EALREADY_ACTIVE_VALIDATOR: u64 = 4;
+    /// Account is not a validator.
+    const ENOT_VALIDATOR: u64 = 5;
+    /// Can't remove last validator.
+    const ELAST_VALIDATOR: u64 = 6;
+    /// Total stake exceeds maximum allowed.
+    const ESTAKE_EXCEEDS_MAX: u64 = 7;
+    /// Account is already registered as a validator candidate.
+    const EALREADY_REGISTERED: u64 = 8;
+    /// Account does not have the right operator capability.
+    const ENOT_OPERATOR: u64 = 9;
+    /// Validators cannot join or leave post genesis on this test network.
+    const ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED: u64 = 10;
+    /// Invalid consensus public key
+    const EINVALID_PUBLIC_KEY: u64 = 11;
+    /// Validator set exceeds the limit
+    const EVALIDATOR_SET_TOO_LARGE: u64 = 12;
+    /// Voting power increase has exceeded the limit for this current epoch.
+    const EVOTING_POWER_INCREASE_EXCEEDS_LIMIT: u64 = 13;
+    /// Stake pool does not exist at the provided pool address.
+    const ESTAKE_POOL_DOES_NOT_EXIST: u64 = 14;
+    /// Owner capability does not exist at the provided account.
+    const EOWNER_CAP_NOT_FOUND: u64 = 15;
+    /// An account cannot own more than one owner capability.
+    const EOWNER_CAP_ALREADY_EXISTS: u64 = 16;
+    /// Validator is not defined in the ACL of entities allowed to be validators
+    const EINELIGIBLE_VALIDATOR: u64 = 17;
+    /// Cannot update stake pool's lockup to earlier than current lockup.
+    const EINVALID_LOCKUP: u64 = 18;
+    /// Table to store collected transaction fees for each validator already exists.
+    const EFEES_TABLE_ALREADY_EXISTS: u64 = 19;
+    /// Validator set change temporarily disabled because of in-progress reconfiguration.
+    const ERECONFIGURATION_IN_PROGRESS: u64 = 20;
+    /// Invalid DKG public key shares.
+    const EDKG_INVALID_PK_SHARES: u64 = 21;
+    /// Another validator in the next validator set already uses this consensus public key.
+    const EDUPLICATE_CONSENSUS_PUBKEY: u64 = 22;
+    /// Another validator in the next validator set already uses these network addresses.
+    const EDUPLICATE_NETWORK_ADDRESSES: u64 = 23;
+    /// The submitted BLS multisig proof-of-possession does not verify against the multisig key.
+    const EINVALID_PROOF_OF_POSSESSION: u64 = 24;
+    /// The submitted consensus public key carries a DKG-managed BLS threshold key share. Only the
+    /// DKG may set those.
+    const EUNEXPECTED_BLS_THRESHOLD_KEY: u64 = 25;
+    /// Under the v2 identity format the validator's stored consensus key is still a legacy-format
+    /// key, which cannot participate in DKG. Rotate the consensus key before joining.
+    const EUNROTATED_LEGACY_CONSENSUS_KEY: u64 = 26;
+
+    /// The submitted consensus key carries a static key -- the network key, the BLS multisig key, the
+    /// class-group key or the ed25519 key -- that another validator in the next validator set already
+    /// holds. Every static key should identify exactly one validator.
+    const EDUPLICATE_STATIC_KEY: u64 = 27;
+    /// A DKG committee output names a threshold type that
+    /// `validator_public_keys::rotate_supra_bls_threshold_key_by_type` does not install a key for.
+    const EDKG_UNINSTALLABLE_THRESHOLD_TYPE: u64 = 28;
+
+    /// Validator status enum. We can switch to proper enum later once Move supports it.
+    const VALIDATOR_STATUS_PENDING_ACTIVE: u64 = 1;
+    const VALIDATOR_STATUS_ACTIVE: u64 = 2;
+    const VALIDATOR_STATUS_PENDING_INACTIVE: u64 = 3;
+    const VALIDATOR_STATUS_INACTIVE: u64 = 4;
+
+    /// Limit the maximum size to u16::max, it's the current limit of the bitvec
+    /// https://github.com/aptos-labs/aptos-core/blob/main/crates/aptos-bitvec/src/lib.rs#L20
+    const MAX_VALIDATOR_SET_SIZE: u64 = 65536;
+
+    /// Limit the maximum value of `rewards_rate` in order to avoid any arithmetic overflow.
+    const MAX_REWARDS_RATE: u64 = 1000000;
+
+    const MAX_U64: u128 = 18446744073709551615;
+
+    /// Capability that represents ownership and can be used to control the validator and the associated stake pool.
+    /// Having this be separate from the signer for the account that the validator resources are hosted at allows
+    /// modules to have control over a validator.
+    struct OwnerCapability has key, store {
+        pool_address: address
+    }
+
+    /// Each validator has a separate StakePool resource and can provide a stake.
+    /// Changes in stake for an active validator:
+    /// 1. If a validator calls add_stake, the newly added stake is moved to pending_active.
+    /// 2. If validator calls unlock, their stake is moved to pending_inactive.
+    /// 2. When the next epoch starts, any pending_inactive stake is moved to inactive and can be withdrawn.
+    ///    Any pending_active stake is moved to active and adds to the validator's voting power.
+    ///
+    /// Changes in stake for an inactive validator:
+    /// 1. If a validator calls add_stake, the newly added stake is moved directly to active.
+    /// 2. If validator calls unlock, their stake is moved directly to inactive.
+    /// 3. When the next epoch starts, the validator can be activated if their active stake is more than the minimum.
+    struct StakePool has key {
+        // active stake
+        active: Coin<SupraCoin>,
+        // inactive stake, can be withdrawn
+        inactive: Coin<SupraCoin>,
+        // pending activation for next epoch
+        pending_active: Coin<SupraCoin>,
+        // pending deactivation for next epoch
+        pending_inactive: Coin<SupraCoin>,
+        locked_until_secs: u64,
+        // Track the current operator of the validator node.
+        // This allows the operator to be different from the original account and allow for separation of
+        // the validator operations and ownership.
+        // Only the account holding OwnerCapability of the staking pool can update this.
+        operator_address: address,
+
+        // Track the current vote delegator of the staking pool.
+        // Only the account holding OwnerCapability of the staking pool can update this.
+        delegated_voter: address,
+
+        // The events emitted for the entire StakePool's lifecycle.
+        initialize_validator_events: EventHandle<RegisterValidatorCandidateEvent>,
+        set_operator_events: EventHandle<SetOperatorEvent>,
+        add_stake_events: EventHandle<AddStakeEvent>,
+        reactivate_stake_events: EventHandle<ReactivateStakeEvent>,
+        rotate_consensus_key_events: EventHandle<RotateConsensusKeyEvent>,
+        update_network_and_fullnode_addresses_events: EventHandle<
+            UpdateNetworkAndFullnodeAddressesEvent>,
+        increase_lockup_events: EventHandle<IncreaseLockupEvent>,
+        join_validator_set_events: EventHandle<JoinValidatorSetEvent>,
+        distribute_rewards_events: EventHandle<DistributeRewardsEvent>,
+        unlock_stake_events: EventHandle<UnlockStakeEvent>,
+        withdraw_stake_events: EventHandle<WithdrawStakeEvent>,
+        leave_validator_set_events: EventHandle<LeaveValidatorSetEvent>
+    }
+
+    /// Validator info stored in validator address.
+    struct ValidatorConfig has key, copy, store, drop {
+        consensus_pubkey: vector<u8>,
+        network_addresses: vector<u8>,
+        // to make it compatible with previous definition, remove later
+        fullnode_addresses: vector<u8>,
+        // Index in the active set if the validator corresponding to this stake pool is active.
+        validator_index: u64
+    }
+
+    /// Consensus information per validator, stored in ValidatorSet.
+    struct ValidatorInfo has copy, store, drop {
+        addr: address,
+        voting_power: u64,
+        config: ValidatorConfig
+    }
+
+    /// Full ValidatorSet, stored in @supra_framework.
+    /// 1. join_validator_set adds to pending_active queue.
+    /// 2. leave_valdiator_set moves from active to pending_inactive queue.
+    /// 3. on_new_epoch processes two pending queues and refresh ValidatorInfo from the owner's address.
+    struct ValidatorSet has copy, key, drop, store {
+        consensus_scheme: u8,
+        // Active validators for the current epoch.
+        active_validators: vector<ValidatorInfo>,
+        // Pending validators to leave in next epoch (still active).
+        pending_inactive: vector<ValidatorInfo>,
+        // Pending validators to join in next epoch.
+        pending_active: vector<ValidatorInfo>,
+        // Current total voting power.
+        total_voting_power: u128,
+        // Total voting power waiting to join in the next epoch.
+        total_joining_power: u128
+    }
+
+    /// The validator set as it stood during the epoch immediately preceding the current one.
+    ///
+    /// `ValidatorSet` is replaced wholesale at every epoch boundary, so state that refers back to a
+    /// past epoch's validators cannot resolve them from it once that epoch has ended. A DKG session
+    /// is exactly such state: it is dealt by one epoch's validators for the next epoch's, so by the
+    /// time its output is consumed the dealing epoch's set is gone. Keeping it here means the
+    /// validator set remains the single record of a validator's configuration, rather than every
+    /// consumer having to copy the parts it needs.
+    ///
+    /// One epoch is all that is needed. Once the DKG is active a session runs at every epoch
+    /// boundary, so the most recently completed session was always dealt by the immediately
+    /// preceding epoch. Consumers assert that before relying on this.
+    ///
+    /// There is deliberately no epoch field. `stake` cannot ask `reconfiguration` for the current
+    /// epoch - that dependency runs the other way - and it does not need to: this is written by
+    /// `on_new_epoch`, which `reconfiguration::reconfigure` calls immediately before incrementing
+    /// the epoch, so this is structurally always exactly one epoch behind.
+    struct PreviousValidatorSet has key {
+        validator_set: ValidatorSet
+    }
+
+    /// SupraCoin capabilities, set during genesis and stored in @CoreResource account.
+    /// This allows the Stake module to mint rewards to stakers.
+    struct SupraCoinCapabilities has key {
+        mint_cap: MintCapability<SupraCoin>
+    }
+
+    struct IndividualValidatorPerformance has store, drop {
+        successful_proposals: u64,
+        failed_proposals: u64
+    }
+
+    struct ValidatorPerformance has key {
+        validators: vector<IndividualValidatorPerformance>
+    }
+
+    struct RegisterValidatorCandidateEvent has drop, store {
+        pool_address: address
+    }
+
+    #[event]
+    struct RegisterValidatorCandidate has drop, store {
+        pool_address: address
+    }
+
+    struct SetOperatorEvent has drop, store {
+        pool_address: address,
+        old_operator: address,
+        new_operator: address
+    }
+
+    #[event]
+    struct SetOperator has drop, store {
+        pool_address: address,
+        old_operator: address,
+        new_operator: address
+    }
+
+    struct AddStakeEvent has drop, store {
+        pool_address: address,
+        amount_added: u64
+    }
+
+    #[event]
+    struct AddStake has drop, store {
+        pool_address: address,
+        amount_added: u64
+    }
+
+    struct ReactivateStakeEvent has drop, store {
+        pool_address: address,
+        amount: u64
+    }
+
+    #[event]
+    struct ReactivateStake has drop, store {
+        pool_address: address,
+        amount: u64
+    }
+
+    struct RotateConsensusKeyEvent has drop, store {
+        pool_address: address,
+        old_consensus_pubkey: vector<u8>,
+        new_consensus_pubkey: vector<u8>
+    }
+
+    #[event]
+    struct RotateConsensusKey has drop, store {
+        pool_address: address,
+        old_consensus_pubkey: vector<u8>,
+        new_consensus_pubkey: vector<u8>
+    }
+
+    struct UpdateNetworkAndFullnodeAddressesEvent has drop, store {
+        pool_address: address,
+        old_network_addresses: vector<u8>,
+        new_network_addresses: vector<u8>,
+        old_fullnode_addresses: vector<u8>,
+        new_fullnode_addresses: vector<u8>
+    }
+
+    #[event]
+    struct UpdateNetworkAndFullnodeAddresses has drop, store {
+        pool_address: address,
+        old_network_addresses: vector<u8>,
+        new_network_addresses: vector<u8>,
+        old_fullnode_addresses: vector<u8>,
+        new_fullnode_addresses: vector<u8>
+    }
+
+    struct IncreaseLockupEvent has drop, store {
+        pool_address: address,
+        old_locked_until_secs: u64,
+        new_locked_until_secs: u64
+    }
+
+    #[event]
+    struct IncreaseLockup has drop, store {
+        pool_address: address,
+        old_locked_until_secs: u64,
+        new_locked_until_secs: u64
+    }
+
+    struct JoinValidatorSetEvent has drop, store {
+        pool_address: address
+    }
+
+    #[event]
+    struct JoinValidatorSet has drop, store {
+        pool_address: address
+    }
+
+    struct DistributeRewardsEvent has drop, store {
+        pool_address: address,
+        rewards_amount: u64
+    }
+
+    #[event]
+    struct DistributeRewards has drop, store {
+        pool_address: address,
+        rewards_amount: u64
+    }
+
+    struct UnlockStakeEvent has drop, store {
+        pool_address: address,
+        amount_unlocked: u64
+    }
+
+    #[event]
+    struct UnlockStake has drop, store {
+        pool_address: address,
+        amount_unlocked: u64
+    }
+
+    struct WithdrawStakeEvent has drop, store {
+        pool_address: address,
+        amount_withdrawn: u64
+    }
+
+    #[event]
+    struct WithdrawStake has drop, store {
+        pool_address: address,
+        amount_withdrawn: u64
+    }
+
+    struct LeaveValidatorSetEvent has drop, store {
+        pool_address: address
+    }
+
+    #[event]
+    struct LeaveValidatorSet has drop, store {
+        pool_address: address
+    }
+
+    #[event]
+    /// Emitted when the delegated voter of the stake pool at `pool_address` is set.
+    struct SetDelegatedVoter has drop, store {
+        pool_address: address,
+        old_voter: address,
+        new_voter: address
+    }
+
+    #[event]
+    /// Emitted when the `OwnerCapability` of the stake pool at `pool_address` is moved out of the
+    /// account at `owner`.
+    struct ExtractOwnerCap has drop, store {
+        owner: address,
+        pool_address: address
+    }
+
+    #[event]
+    /// Emitted when the `OwnerCapability` of the stake pool at `pool_address` is stored under the
+    /// account at `owner`.
+    struct DepositOwnerCap has drop, store {
+        owner: address,
+        pool_address: address
+    }
+
+    #[event]
+    /// Emitted when the `OwnerCapability` of the stake pool at `pool_address` is destroyed.
+    struct DestroyOwnerCap has drop, store {
+        pool_address: address
+    }
+
+    /// Stores transaction fees assigned to validators. All fees are distributed to validators
+    /// at the end of the epoch.
+    struct ValidatorFees has key {
+        fees_table: Table<address, Coin<SupraCoin>>
+    }
+
+    /// Initializes the resource storing information about collected transaction fees per validator.
+    /// Used by `transaction_fee.move` to initialize fee collection and distribution.
+    public(friend) fun initialize_validator_fees(
+        supra_framework: &signer
+    ) {
+        system_addresses::assert_supra_framework(supra_framework);
+        assert!(
+            !exists<ValidatorFees>(@supra_framework),
+            error::already_exists(EFEES_TABLE_ALREADY_EXISTS)
+        );
+        move_to(supra_framework, ValidatorFees { fees_table: table::new() });
+    }
+
+    /// Stores the transaction fee collected to the specified validator address.
+    public(friend) fun add_transaction_fee(
+        validator_addr: address, fee: Coin<SupraCoin>
+    ) acquires ValidatorFees {
+        let fees_table =
+            &mut borrow_global_mut<ValidatorFees>(@supra_framework).fees_table;
+        if (table::contains(fees_table, validator_addr)) {
+            let collected_fee = table::borrow_mut(fees_table, validator_addr);
+            coin::merge(collected_fee, fee);
+        } else {
+            table::add(fees_table, validator_addr, fee);
+        }
+    }
+
+    #[view]
+    /// Return the lockup expiration of the stake pool at `pool_address`.
+    /// This will throw an error if there's no stake pool at `pool_address`.
+    public fun get_lockup_secs(pool_address: address): u64 acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        borrow_global<StakePool>(pool_address).locked_until_secs
+    }
+
+    #[view]
+    /// Return the remaining lockup of the stake pool at `pool_address`.
+    /// This will throw an error if there's no stake pool at `pool_address`.
+    public fun get_remaining_lockup_secs(pool_address: address): u64 acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        let lockup_time = borrow_global<StakePool>(pool_address).locked_until_secs;
+        if (lockup_time <= timestamp::now_seconds()) { 0 }
+        else {
+            lockup_time - timestamp::now_seconds()
+        }
+    }
+
+    #[view]
+    /// Return the different stake amounts for `pool_address` (whether the validator is active or not).
+    /// The returned amounts are for (active, inactive, pending_active, pending_inactive) stake respectively.
+    public fun get_stake(pool_address: address): (u64, u64, u64, u64) acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global<StakePool>(pool_address);
+        (
+            coin::value(&stake_pool.active),
+            coin::value(&stake_pool.inactive),
+            coin::value(&stake_pool.pending_active),
+            coin::value(&stake_pool.pending_inactive)
+        )
+    }
+
+    #[view]
+    /// Returns the validator's state.
+    public fun get_validator_state(pool_address: address): u64 acquires ValidatorSet {
+        let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        if (option::is_some(
+            &find_validator(&validator_set.pending_active, pool_address)
+        )) {
+            VALIDATOR_STATUS_PENDING_ACTIVE
+        } else if (option::is_some(
+            &find_validator(&validator_set.active_validators, pool_address)
+        )) {
+            VALIDATOR_STATUS_ACTIVE
+        } else if (option::is_some(
+            &find_validator(&validator_set.pending_inactive, pool_address)
+        )) {
+            VALIDATOR_STATUS_PENDING_INACTIVE
+        } else {
+            VALIDATOR_STATUS_INACTIVE
+        }
+    }
+
+    #[view]
+    /// Return the voting power of the validator in the current epoch.
+    /// This is the same as the validator's total active and pending_inactive stake.
+    public fun get_current_epoch_voting_power(
+        pool_address: address
+    ): u64 acquires StakePool, ValidatorSet {
+        assert_stake_pool_exists(pool_address);
+        let validator_state = get_validator_state(pool_address);
+        // Both active and pending inactive validators can still vote in the current epoch.
+        if (validator_state == VALIDATOR_STATUS_ACTIVE
+            || validator_state == VALIDATOR_STATUS_PENDING_INACTIVE) {
+            let active_stake =
+                coin::value(&borrow_global<StakePool>(pool_address).active);
+            let pending_inactive_stake =
+                coin::value(&borrow_global<StakePool>(pool_address).pending_inactive);
+            active_stake + pending_inactive_stake
+        } else { 0 }
+    }
+
+    #[view]
+    /// Return the delegated voter of the validator at `pool_address`.
+    public fun get_delegated_voter(pool_address: address): address acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        borrow_global<StakePool>(pool_address).delegated_voter
+    }
+
+    #[view]
+    /// Return the operator of the validator at `pool_address`.
+    public fun get_operator(pool_address: address): address acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        borrow_global<StakePool>(pool_address).operator_address
+    }
+
+    /// Return the pool address in `owner_cap`.
+    public fun get_owned_pool_address(owner_cap: &OwnerCapability): address {
+        owner_cap.pool_address
+    }
+
+    #[view]
+    /// Return the validator index for `pool_address`.
+    public fun get_validator_index(pool_address: address): u64 acquires ValidatorConfig {
+        assert_stake_pool_exists(pool_address);
+        borrow_global<ValidatorConfig>(pool_address).validator_index
+    }
+
+    #[view]
+    /// Return the number of successful and failed proposals for the proposal at the given validator index.
+    public fun get_current_epoch_proposal_counts(
+        validator_index: u64
+    ): (u64, u64) acquires ValidatorPerformance {
+        let validator_performances =
+            &borrow_global<ValidatorPerformance>(@supra_framework).validators;
+        let validator_performance = vector::borrow(
+            validator_performances, validator_index
+        );
+        (
+            validator_performance.successful_proposals,
+            validator_performance.failed_proposals
+        )
+    }
+
+    #[view]
+    /// Return the validator's config.
+    public fun get_validator_config(
+        pool_address: address
+    ): (vector<u8>, vector<u8>, vector<u8>) acquires ValidatorConfig {
+        assert_stake_pool_exists(pool_address);
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        (
+            validator_config.consensus_pubkey,
+            validator_config.network_addresses,
+            validator_config.fullnode_addresses
+        )
+    }
+
+    #[view]
+    public fun stake_pool_exists(addr: address): bool {
+        exists<StakePool>(addr)
+    }
+
+    /// Initialize validator set to the core resource account.
+    public(friend) fun initialize(supra_framework: &signer) {
+        system_addresses::assert_supra_framework(supra_framework);
+
+        move_to(
+            supra_framework,
+            ValidatorSet {
+                consensus_scheme: 0,
+                active_validators: vector::empty(),
+                pending_active: vector::empty(),
+                pending_inactive: vector::empty(),
+                total_voting_power: 0,
+                total_joining_power: 0
+            }
+        );
+
+        move_to(supra_framework, ValidatorPerformance { validators: vector::empty() });
+    }
+
+    /// This is only called during Genesis, which is where MintCapability<SupraCoin> can be created.
+    /// Beyond genesis, no one can create SupraCoin mint/burn capabilities.
+    public(friend) fun store_supra_coin_mint_cap(
+        supra_framework: &signer, mint_cap: MintCapability<SupraCoin>
+    ) {
+        system_addresses::assert_supra_framework(supra_framework);
+        move_to(supra_framework, SupraCoinCapabilities { mint_cap })
+    }
+
+    /// To get validator pool address from validator index
+    public(friend) fun get_pool_address_from_index(
+        index: u64
+    ): Option<address> acquires ValidatorSet {
+        if (exists<ValidatorSet>(@supra_framework)) {
+            let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+            // it can happen that some validator may added a leave request in between
+            // this can change the order of indexes in active validator
+            // so need to iterate through all until find pool address in active and  pending_active
+            let (is_index_exist, i) = vector::find(
+                &validator_set.active_validators,
+                |v| {
+                    let v: &ValidatorInfo = v;
+                    v.config.validator_index == index
+                }
+            );
+            if (is_index_exist) {
+                let v_info = vector::borrow(&validator_set.active_validators, i);
+                return option::some(v_info.addr)
+            };
+            let (is_index_exist, i) = vector::find(
+                &validator_set.pending_inactive,
+                |v| {
+                    let v: &ValidatorInfo = v;
+                    v.config.validator_index == index
+                }
+            );
+            if (is_index_exist) {
+                let v_info = vector::borrow(&validator_set.pending_inactive, i);
+                return option::some(v_info.addr)
+            };
+        };
+        option::none()
+    }
+
+    /// Returns committee size
+    public(friend) fun get_committee_size(): u64 acquires ValidatorSet {
+        let commitee_size = 0;
+        if (exists<ValidatorSet>(@supra_framework)) {
+            let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+            commitee_size = vector::length(&validator_set.active_validators)
+                + vector::length(&validator_set.pending_inactive);
+        };
+        commitee_size
+    }
+
+    /// Returns pool addresses of current committee including pending inactive
+    public(friend) fun get_committee_pool_addresses(): vector<address> acquires ValidatorSet {
+        let pool_addresses = vector::empty();
+        if (exists<ValidatorSet>(@supra_framework)) {
+            let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+            vector::for_each_ref(
+                &validator_set.active_validators,
+                |validator_info| {
+                    let validator_info: &ValidatorInfo = validator_info;
+                    vector::push_back(&mut pool_addresses, validator_info.addr);
+                }
+            );
+            vector::for_each_ref(
+                &validator_set.pending_inactive,
+                |validator_info| {
+                    let validator_info: &ValidatorInfo = validator_info;
+                    vector::push_back(&mut pool_addresses, validator_info.addr);
+                }
+            );
+        };
+        pool_addresses
+    }
+
+    /// Allow on chain governance to remove validators from the validator set.
+    public fun remove_validators(
+        supra_framework: &signer, validators: &vector<address>
+    ) acquires ValidatorSet {
+        assert_reconfig_not_in_progress();
+        system_addresses::assert_supra_framework(supra_framework);
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        let active_validators = &mut validator_set.active_validators;
+        let pending_inactive = &mut validator_set.pending_inactive;
+        spec {};
+        let len_validators = vector::length(validators);
+        let i = 0;
+        // Remove each validator from the validator set.
+        while ({
+            spec {};
+            i < len_validators
+        }) {
+            let validator = *vector::borrow(validators, i);
+            let validator_index = find_validator(active_validators, validator);
+            if (option::is_some(&validator_index)) {
+                let validator_info = vector::swap_remove(
+                    active_validators, *option::borrow(&validator_index)
+                );
+                vector::push_back(pending_inactive, validator_info);
+                spec {};
+            };
+            i = i + 1;
+        };
+    }
+
+    /// Initialize the validator account and give ownership to the signing account
+    /// except it leaves the ValidatorConfig to be set by another entity.
+    /// Note: this triggers setting the operator and owner, set it to the account's address
+    /// to set later.
+    public entry fun initialize_stake_owner(
+        owner: &signer,
+        initial_stake_amount: u64,
+        operator: address,
+        voter: address
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorSet {
+        initialize_owner(owner);
+        move_to(
+            owner,
+            ValidatorConfig {
+                consensus_pubkey: vector::empty(),
+                network_addresses: vector::empty(),
+                fullnode_addresses: vector::empty(),
+                validator_index: 0
+            }
+        );
+
+        if (initial_stake_amount != 0) {
+            add_stake(owner, initial_stake_amount);
+        };
+
+        let account_address = signer::address_of(owner);
+        if (account_address != operator) {
+            set_operator(owner, operator)
+        };
+        if (account_address != voter) {
+            set_delegated_voter(owner, voter)
+        };
+    }
+
+    /// Initialize the validator account and give ownership to the signing account.
+    public entry fun initialize_validator(
+        account: &signer,
+        consensus_pubkey: vector<u8>,
+        network_addresses: vector<u8>,
+        fullnode_addresses: vector<u8>
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_validator_internal(
+            account,
+            consensus_pubkey,
+            network_addresses,
+            fullnode_addresses,
+            false
+        );
+    }
+
+    /// Initialize a validator during genesis. Identical to `initialize_validator` except that the
+    /// consensus key blob is trusted genesis output and therefore carries no operator
+    /// proof-of-possession (mirrors `rotate_consensus_key` / `rotate_consensus_key_genesis`).
+    public(friend) fun initialize_validator_genesis(
+        account: &signer,
+        consensus_pubkey: vector<u8>,
+        network_addresses: vector<u8>,
+        fullnode_addresses: vector<u8>
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_validator_internal(
+            account,
+            consensus_pubkey,
+            network_addresses,
+            fullnode_addresses,
+            true
+        );
+    }
+
+    fun initialize_validator_internal(
+        account: &signer,
+        consensus_pubkey: vector<u8>,
+        network_addresses: vector<u8>,
+        fullnode_addresses: vector<u8>,
+        genesis: bool
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        // Verify the keys (and, for operator submissions, the appended BLS multisig PoP) and keep
+        // only the canonical key bytes (any appended PoP is stripped before storage). Registration
+        // stores the submitted blob as the validator's consensus key with no merge, so the blob
+        // must not carry any DKG-managed threshold key share.
+        let consensus_pubkey = validate_consensus_public_key(
+            consensus_pubkey, genesis, true
+        );
+        let account_addr = signer::address_of(account);
+        assert_consensus_pubkey_unique_in_next_validator_set(
+            account_addr, &consensus_pubkey
+        );
+        assert_network_addresses_unique_in_next_validator_set(
+            account_addr, &network_addresses
+        );
+        initialize_owner(account);
+        move_to(
+            account,
+            ValidatorConfig {
+                consensus_pubkey,
+                network_addresses,
+                fullnode_addresses,
+                validator_index: 0
+            }
+        );
+    }
+
+    // Verifies a submitted consensus key blob and returns the canonical key bytes to store.
+    //
+    // A legacy consensus key (a bare ed25519 public key) is only accepted before the v2 identity
+    // feature flag is activated; it has no aggregatable BLS key and so carries no proof-of-possession.
+    //
+    // Every other (new-format `ValidatorPublicKeys`) submission -- whether under v2 or via the
+    // pre-v2 early-migration path -- must carry an appended BLS12-381 proof-of-possession for the
+    // BLS multisig key (operator / non-genesis submissions only; genesis output is trusted and
+    // carries no PoP). The multisig key is the only operator-submitted key exposed to rogue-key
+    // attacks (the class-group key carries its own ZK PoP verified by its native, the ed25519 keys
+    // are non-aggregated, and the BLS threshold shares are DKG-produced). We split off and verify
+    // that PoP (see `validator_public_keys::split_consensus_key_and_pop`) and return the key bytes
+    // with the PoP stripped, so the stored key keeps its canonical format. PoP enforcement is tied
+    // to the key format, not the v2 flag, so a key registered during the pre-v2 migration window
+    // cannot skip it.
+    //
+    // Deserialization (`validator_public_keys_from_bytes`) only reconstructs each key's bytes
+    // without running the per-key validation natives, so we also re-validate every static key via
+    // `validate_static_keys` (on-curve / subgroup / valid-encoding checks).
+    //
+    // `stores_keys_verbatim` says that the caller installs the returned bytes as the validator's
+    // consensus key unchanged, rather than merging only their static keys into the blob already
+    // stored. The DKG-managed BLS threshold key shares belong to the protocol:
+    // `set_dkg_output_keys` is their only writer, and deserialization rebuilds them from the
+    // submitted bytes without running a validating native. Every path that stores a submission
+    // verbatim therefore rejects one carrying any of them, so that only DKG output ever occupies
+    // those fields.
+    //
+    // A rotation that does merge is exempt by design. `validator_public_keys::replace_static_keys`
+    // copies only the four static keys out of the submission, so its threshold fields never reach
+    // storage, and an operator's node legitimately holds the current epoch's shares at the moment it
+    // builds a rotation payload. Both properties are permanent rather than transitional, so the
+    // merge path is expected to stay exempt.
+    //
+    // Genesis output is trusted protocol input rather than an operator submission, so it is exempt
+    // here as it is from the PoP requirement.
+    fun validate_consensus_public_key(
+        consensus_pubkey: vector<u8>, genesis: bool, stores_keys_verbatim: bool
+    ): vector<u8> {
+        // Legacy format (only acceptable before v2): a bare ed25519 key with no aggregatable BLS
+        // key, hence no PoP. Accept and store it unchanged.
+        if (!std::features::supra_validator_identity_v2_enabled()) {
+            let maybe_legacy =
+                ed25519::new_validated_public_key_from_bytes(consensus_pubkey);
+            if (option::is_some(&maybe_legacy)) {
+                return consensus_pubkey
+            };
+        };
+
+        // New identity format (v2, or a pre-v2 early-migration submission). Operator (non-genesis)
+        // submissions carry an appended BLS multisig PoP; verify and strip it. Genesis is exempt.
+        let (keys_bytes, maybe_pop) =
+            if (genesis) {
+                (consensus_pubkey, option::none<vector<u8>>())
+            } else {
+                let (keys_bytes, pop) =
+                    validator_public_keys::split_consensus_key_and_pop(consensus_pubkey);
+                (keys_bytes, option::some(pop))
+            };
+
+        let valid_public_keys =
+            validator_public_keys::validator_public_keys_from_bytes(keys_bytes);
+
+        if (option::is_some(&maybe_pop)) {
+            assert!(
+                validator_public_keys::verify_bls_multisig_pop(
+                    &valid_public_keys, option::extract(&mut maybe_pop)
+                ),
+                error::invalid_argument(EINVALID_PROOF_OF_POSSESSION)
+            );
+        };
+
+        assert!(
+            validator_public_keys::validate_static_keys(&valid_public_keys),
+            error::invalid_argument(EINVALID_PUBLIC_KEY)
+        );
+
+        if (!genesis && stores_keys_verbatim) {
+            assert!(
+                validator_public_keys::has_no_bls_threshold_keys(&valid_public_keys),
+                error::invalid_argument(EUNEXPECTED_BLS_THRESHOLD_KEY)
+            );
+        };
+
+        keys_bytes
+    }
+
+    /// Returns true iff the v2 validator-identity format is required and `consensus_pubkey` is still
+    /// a legacy (pre-v2) bare ed25519 key. Mirrors the detection in `validate_consensus_public_key`: a
+    /// bare ed25519 key parses via `new_validated_public_key_from_bytes`, while a v2 BCS blob does not.
+    /// Such a key cannot be deserialized into the v2 `ValidatorPublicKeys` format that DKG and
+    /// consensus require, so the validator is dropped from the active set (same effect as falling below
+    /// the minimum stake) until it rotates.
+    ///
+    /// The v2 format is required when either `SUPRA_BLS_KEYS` or `SUPRA_DKG` is enabled. `SUPRA_DKG`
+    /// counts on its own so that a validator holding a legacy key is never a member of a DKG
+    /// committee, independently of the feature-flag prerequisite that `std::features` enforces.
+    /// See Entropy-Foundation/smr-moonshot#3264.
+    fun is_unrotated_legacy_key(consensus_pubkey: &vector<u8>): bool {
+        (features::supra_validator_identity_v2_enabled() || features::supra_dkg_enabled())
+            && option::is_some(
+                &ed25519::new_validated_public_key_from_bytes(*consensus_pubkey)
+            )
+    }
+
+    /// Active-set membership test used by `compute_next_validator_set_internal` (whose result
+    /// both the DKG receiver committee / `set_dkg_output_keys` preview and `on_new_epoch`'s
+    /// committed set are built from): a validator is retained iff its stake alone (no rewards
+    /// or fees, which keep accruing while a reconfiguration is in progress) meets the minimum
+    /// AND (while the v2 identity format is required, see `is_unrotated_legacy_key`) it carries a
+    /// v2 consensus key.
+    fun is_eligible_active_validator(
+        base_power: u64, minimum_stake: u64, consensus_pubkey: &vector<u8>
+    ): bool {
+        base_power >= minimum_stake && !is_unrotated_legacy_key(consensus_pubkey)
+    }
+
+    /// Aborts if any validator other than `self_addr` in the next validator set (the union of
+    /// `active_validators` and `pending_active`) already uses `consensus_pubkey` as its latest
+    /// on-chain consensus key, or already holds any one of the static keys that key carries.
+    fun assert_consensus_pubkey_unique_in_next_validator_set(
+        self_addr: address, consensus_pubkey: &vector<u8>
+    ) acquires ValidatorSet, ValidatorConfig {
+        // Parsed once here rather than per candidate: the comparison needs the static keys the blob
+        // carries, and recovering them is the expensive part of the check.
+        let submitted_keys = try_parse_consensus_pubkey(consensus_pubkey);
+        let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        assert_consensus_pubkey_unique_in_validator_list(
+            self_addr,
+            consensus_pubkey,
+            &submitted_keys,
+            &validator_set.active_validators
+        );
+        assert_consensus_pubkey_unique_in_validator_list(
+            self_addr,
+            consensus_pubkey,
+            &submitted_keys,
+            &validator_set.pending_active
+        );
+    }
+
+    fun assert_consensus_pubkey_unique_in_validator_list(
+        self_addr: address,
+        consensus_pubkey: &vector<u8>,
+        submitted_keys: &Option<ValidatorPublicKeys>,
+        validators: &vector<ValidatorInfo>
+    ) acquires ValidatorConfig {
+        let len = vector::length(validators);
+        let i = 0;
+        while (i < len) {
+            let other = vector::borrow(validators, i);
+            if (other.addr != self_addr && exists<ValidatorConfig>(other.addr)) {
+                let other_config = borrow_global<ValidatorConfig>(other.addr);
+                // Whole-blob equality. This is the only comparison available when either side is a
+                // legacy key, which carries no static keys to compare.
+                assert!(
+                    other_config.consensus_pubkey != *consensus_pubkey,
+                    error::invalid_argument(EDUPLICATE_CONSENSUS_PUBKEY)
+                );
+                if (option::is_some(submitted_keys)) {
+                    let other_keys =
+                        try_parse_consensus_pubkey(&other_config.consensus_pubkey);
+                    if (option::is_some(&other_keys)) {
+                        assert!(
+                            !validator_public_keys::shares_any_static_key(
+                                option::borrow(submitted_keys),
+                                option::borrow(&other_keys)
+                            ),
+                            error::invalid_argument(EDUPLICATE_STATIC_KEY)
+                        );
+                    };
+                };
+            };
+            i = i + 1;
+        };
+    }
+
+    /// Recovers the `ValidatorPublicKeys` carried by a stored or submitted consensus key, or
+    /// `option::none()` when the key holds no static keys to recover: an empty key, which a stake
+    /// pool created via `initialize_stake_owner` holds until its first rotation, or a legacy bare
+    /// ed25519 key.
+    ///
+    /// Format detection mirrors `is_unrotated_legacy_key`: a legacy key parses as a bare ed25519
+    /// public key and a v2 blob does not. It deliberately does not consult the v2 feature flag,
+    /// because what matters here is the format in front of it rather than which format is currently
+    /// required. Every key reaching this point has been through `validate_consensus_public_key`,
+    /// which stores only one of the two formats, so a key that is neither empty nor legacy parses.
+    fun try_parse_consensus_pubkey(consensus_pubkey: &vector<u8>): Option<ValidatorPublicKeys> {
+        if (vector::is_empty(consensus_pubkey)) {
+            return option::none()
+        };
+        if (option::is_some(&ed25519::new_validated_public_key_from_bytes(*consensus_pubkey))) {
+            return option::none()
+        };
+        option::some(
+            validator_public_keys::validator_public_keys_from_bytes(*consensus_pubkey)
+        )
+    }
+
+    /// Aborts if any validator other than `self_addr` in the next validator set
+    /// already uses `network_addresses`. Empty `network_addresses` is treated
+    /// as "unset" and skips the check.
+    fun assert_network_addresses_unique_in_next_validator_set(
+        self_addr: address, network_addresses: &vector<u8>
+    ) acquires ValidatorSet, ValidatorConfig {
+        if (vector::is_empty(network_addresses)) { return };
+        let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        assert_network_addresses_unique_in_validator_list(
+            self_addr, network_addresses, &validator_set.active_validators
+        );
+        assert_network_addresses_unique_in_validator_list(
+            self_addr, network_addresses, &validator_set.pending_active
+        );
+    }
+
+    fun assert_network_addresses_unique_in_validator_list(
+        self_addr: address,
+        network_addresses: &vector<u8>,
+        validators: &vector<ValidatorInfo>
+    ) acquires ValidatorConfig {
+        let len = vector::length(validators);
+        let i = 0;
+        while (i < len) {
+            let other = vector::borrow(validators, i);
+            if (other.addr != self_addr && exists<ValidatorConfig>(other.addr)) {
+                let other_config = borrow_global<ValidatorConfig>(other.addr);
+                assert!(
+                    other_config.network_addresses != *network_addresses,
+                    error::invalid_argument(EDUPLICATE_NETWORK_ADDRESSES)
+                );
+            };
+            i = i + 1;
+        };
+    }
+
+    fun initialize_owner(owner: &signer) acquires AllowedValidators {
+        let owner_address = signer::address_of(owner);
+        assert!(is_allowed(owner_address), error::not_found(EINELIGIBLE_VALIDATOR));
+        assert!(
+            !stake_pool_exists(owner_address),
+            error::already_exists(EALREADY_REGISTERED)
+        );
+
+        move_to(
+            owner,
+            StakePool {
+                active: coin::zero<SupraCoin>(),
+                pending_active: coin::zero<SupraCoin>(),
+                pending_inactive: coin::zero<SupraCoin>(),
+                inactive: coin::zero<SupraCoin>(),
+                locked_until_secs: 0,
+                operator_address: owner_address,
+                delegated_voter: owner_address,
+                // Events.
+                initialize_validator_events: account::new_event_handle<
+                    RegisterValidatorCandidateEvent>(owner),
+                set_operator_events: account::new_event_handle<SetOperatorEvent>(owner),
+                add_stake_events: account::new_event_handle<AddStakeEvent>(owner),
+                reactivate_stake_events: account::new_event_handle<ReactivateStakeEvent>(
+                    owner
+                ),
+                rotate_consensus_key_events: account::new_event_handle<
+                    RotateConsensusKeyEvent>(owner),
+                update_network_and_fullnode_addresses_events: account::new_event_handle<
+                    UpdateNetworkAndFullnodeAddressesEvent>(owner),
+                increase_lockup_events: account::new_event_handle<IncreaseLockupEvent>(
+                    owner
+                ),
+                join_validator_set_events: account::new_event_handle<JoinValidatorSetEvent>(
+                    owner
+                ),
+                distribute_rewards_events: account::new_event_handle<DistributeRewardsEvent>(
+                    owner
+                ),
+                unlock_stake_events: account::new_event_handle<UnlockStakeEvent>(owner),
+                withdraw_stake_events: account::new_event_handle<WithdrawStakeEvent>(owner),
+                leave_validator_set_events: account::new_event_handle<
+                    LeaveValidatorSetEvent>(owner)
+            }
+        );
+
+        move_to(owner, OwnerCapability { pool_address: owner_address });
+        event::emit(DepositOwnerCap { owner: owner_address, pool_address: owner_address });
+    }
+
+    /// Extract and return owner capability from the signing account.
+    public fun extract_owner_cap(owner: &signer): OwnerCapability acquires OwnerCapability {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let owner_cap = move_from<OwnerCapability>(owner_address);
+        event::emit(
+            ExtractOwnerCap { owner: owner_address, pool_address: owner_cap.pool_address }
+        );
+        owner_cap
+    }
+
+    /// Deposit `owner_cap` into `account`. This requires `account` to not already have ownership of another
+    /// staking pool.
+    public fun deposit_owner_cap(
+        owner: &signer, owner_cap: OwnerCapability
+    ) {
+        let owner_address = signer::address_of(owner);
+        assert!(
+            !exists<OwnerCapability>(owner_address),
+            error::not_found(EOWNER_CAP_ALREADY_EXISTS)
+        );
+        let pool_address = owner_cap.pool_address;
+        move_to(owner, owner_cap);
+        event::emit(DepositOwnerCap { owner: owner_address, pool_address });
+    }
+
+    /// Destroy `owner_cap`.
+    public fun destroy_owner_cap(owner_cap: OwnerCapability) {
+        let OwnerCapability { pool_address } = owner_cap;
+        event::emit(DestroyOwnerCap { pool_address });
+    }
+
+    /// Allows an owner to change the operator of the stake pool.
+    public entry fun set_operator(
+        owner: &signer, new_operator: address
+    ) acquires OwnerCapability, StakePool {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        set_operator_with_cap(ownership_cap, new_operator);
+    }
+
+    /// Allows an account with ownership capability to change the operator of the stake pool.
+    public fun set_operator_with_cap(
+        owner_cap: &OwnerCapability, new_operator: address
+    ) acquires StakePool {
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let old_operator = stake_pool.operator_address;
+        stake_pool.operator_address = new_operator;
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(SetOperator { pool_address, old_operator, new_operator });
+        };
+
+        event::emit_event(
+            &mut stake_pool.set_operator_events,
+            SetOperatorEvent { pool_address, old_operator, new_operator }
+        );
+    }
+
+    /// Allows an owner to change the delegated voter of the stake pool.
+    public entry fun set_delegated_voter(
+        owner: &signer, new_voter: address
+    ) acquires OwnerCapability, StakePool {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        set_delegated_voter_with_cap(ownership_cap, new_voter);
+    }
+
+    /// Allows an owner to change the delegated voter of the stake pool.
+    public fun set_delegated_voter_with_cap(
+        owner_cap: &OwnerCapability, new_voter: address
+    ) acquires StakePool {
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let old_voter = stake_pool.delegated_voter;
+        stake_pool.delegated_voter = new_voter;
+
+        event::emit(SetDelegatedVoter { pool_address, old_voter, new_voter });
+    }
+
+    /// Add `amount` of coins from the `account` owning the StakePool.
+    public entry fun add_stake(
+        owner: &signer, amount: u64
+    ) acquires OwnerCapability, StakePool, ValidatorSet {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        add_stake_with_cap(ownership_cap, coin::withdraw<SupraCoin>(owner, amount));
+    }
+
+    /// Add `coins` into `pool_address`. this requires the corresponding `owner_cap` to be passed in.
+    public fun add_stake_with_cap(
+        owner_cap: &OwnerCapability, coins: Coin<SupraCoin>
+    ) acquires StakePool, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+
+        let amount = coin::value(&coins);
+        if (amount == 0) {
+            coin::destroy_zero(coins);
+            return
+        };
+
+        // Only track and validate voting power increase for active and pending_active validator.
+        // Pending_inactive validator will be removed from the validator set in the next epoch.
+        // Inactive validator's total stake will be tracked when they join the validator set.
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        // Search directly rather using get_validator_state to save on unnecessary loops.
+        if (option::is_some(
+            &find_validator(&validator_set.active_validators, pool_address)
+        ) || option::is_some(
+            &find_validator(&validator_set.pending_active, pool_address)
+        )) {
+            update_voting_power_increase(amount);
+        };
+
+        // Add to pending_active if it's a current validator because the stake is not counted until the next epoch.
+        // Otherwise, the delegation can be added to active directly as the validator is also activated in the epoch.
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        if (is_current_epoch_validator(pool_address)) {
+            coin::merge<SupraCoin>(&mut stake_pool.pending_active, coins);
+        } else {
+            coin::merge<SupraCoin>(&mut stake_pool.active, coins);
+        };
+
+        let (_, maximum_stake) =
+            staking_config::get_required_stake(&staking_config::get());
+        let voting_power = get_next_epoch_voting_power(stake_pool);
+        assert!(
+            voting_power <= maximum_stake, error::invalid_argument(ESTAKE_EXCEEDS_MAX)
+        );
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(AddStake { pool_address, amount_added: amount });
+        };
+        event::emit_event(
+            &mut stake_pool.add_stake_events,
+            AddStakeEvent { pool_address, amount_added: amount }
+        );
+    }
+
+    /// Move `amount` of coins from pending_inactive to active.
+    public entry fun reactivate_stake(owner: &signer, amount: u64) acquires OwnerCapability, StakePool {
+        assert_reconfig_not_in_progress();
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        reactivate_stake_with_cap(ownership_cap, amount);
+    }
+
+    public fun reactivate_stake_with_cap(
+        owner_cap: &OwnerCapability, amount: u64
+    ) acquires StakePool {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+
+        // Cap the amount to reactivate by the amount in pending_inactive.
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let total_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        amount = min(amount, total_pending_inactive);
+
+        // Since this does not count as a voting power change (pending inactive still counts as voting power in the
+        // current epoch), stake can be immediately moved from pending inactive to active.
+        // We also don't need to check voting power increase as there's none.
+        let reactivated_coins = coin::extract(&mut stake_pool.pending_inactive, amount);
+        coin::merge(&mut stake_pool.active, reactivated_coins);
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(ReactivateStake { pool_address, amount });
+        };
+        event::emit_event(
+            &mut stake_pool.reactivate_stake_events,
+            ReactivateStakeEvent { pool_address, amount }
+        );
+    }
+
+    fun rotate_consensus_key_internal(
+        operator: &signer,
+        pool_address: address,
+        new_consensus_pubkey: vector<u8>,
+        genesis: bool
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        assert_stake_pool_exists(pool_address);
+
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        assert!(
+            signer::address_of(operator) == stake_pool.operator_address,
+            error::unauthenticated(ENOT_OPERATOR)
+        );
+
+        assert!(
+            exists<ValidatorConfig>(pool_address),
+            error::not_found(EVALIDATOR_CONFIG)
+        );
+        let old_consensus_pubkey =
+            borrow_global<ValidatorConfig>(pool_address).consensus_pubkey;
+
+        // Preserve the DKG-managed BLS threshold keys: an operator rotation must only change the
+        // static keys. Where there is something to preserve we load the current on-chain keys and
+        // copy in only the operator-supplied static keys, leaving the threshold keys (written by
+        // `set_dkg_output_keys`) intact. `validate_consensus_public_key` has already established
+        // that the incoming blob is a well-formed `ValidatorPublicKeys`.
+        //
+        // The merge is skipped, and the submission becomes the stored key unchanged, when there is
+        // nothing to preserve or the stored blob cannot be parsed:
+        //  - an empty stored key. A pool created via `initialize_stake_owner` sets its consensus key
+        //    for the first time here, so there is no prior `ValidatorPublicKeys` to merge into and
+        //    parsing the empty blob would abort. Setting a key for the first time is a
+        //    registration, which is why `validate_consensus_public_key` is asked to reject
+        //    DKG-managed threshold keys whenever the merge is skipped.
+        //  - an unmigrated legacy stored key. Parsing a bare ed25519 key as a `ValidatorPublicKeys`
+        //    would abort, and there is nothing to preserve: such a validator is excluded from the
+        //    active set (see `is_eligible_active_validator`) and so from every DKG committee.
+        //  - before v2, where the stored blob may be a legacy key, and at genesis, where no DKG
+        //    threshold keys exist yet.
+        let merges_static_keys =
+            !genesis
+                && std::features::supra_validator_identity_v2_enabled()
+                && !vector::is_empty(&old_consensus_pubkey)
+                && !is_unrotated_legacy_key(&old_consensus_pubkey);
+
+        // Verify the keys (and, for operator submissions, the appended BLS multisig PoP) and keep
+        // only the canonical key bytes (any appended PoP is stripped before storage/merge).
+        let new_consensus_pubkey =
+            validate_consensus_public_key(
+                new_consensus_pubkey, genesis, !merges_static_keys
+            );
+        assert_consensus_pubkey_unique_in_next_validator_set(
+            pool_address, &new_consensus_pubkey
+        );
+        let validator_info = borrow_global_mut<ValidatorConfig>(pool_address);
+
+        let new_consensus_pubkey =
+            if (merges_static_keys) {
+                let current_keys =
+                    validator_public_keys::validator_public_keys_from_bytes(
+                        old_consensus_pubkey
+                    );
+                let incoming_keys =
+                    validator_public_keys::validator_public_keys_from_bytes(
+                        new_consensus_pubkey
+                    );
+                validator_public_keys::replace_static_keys(
+                    &mut current_keys, &incoming_keys
+                );
+                validator_public_keys::public_key_to_bytes(current_keys)
+            } else {
+                new_consensus_pubkey
+            };
+        validator_info.consensus_pubkey = new_consensus_pubkey;
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(
+                RotateConsensusKey {
+                    pool_address,
+                    old_consensus_pubkey,
+                    new_consensus_pubkey
+                }
+            );
+        };
+        event::emit_event(
+            &mut stake_pool.rotate_consensus_key_events,
+            RotateConsensusKeyEvent {
+                pool_address,
+                old_consensus_pubkey,
+                new_consensus_pubkey
+            }
+        );
+    }
+
+    /// Preserve the outgoing epoch's validator set before `on_new_epoch` replaces it.
+    ///
+    /// Note what this does *not* have to contend with: the entries hold a by-value copy of each
+    /// validator's `ValidatorConfig`, taken when the epoch began, so a later `rotate_consensus_key`
+    /// writes `ValidatorConfig` without disturbing the copy. An archived set is therefore immutable,
+    /// and so is the live one for the duration of its epoch.
+    fun archive_current_validator_set() acquires ValidatorSet, PreviousValidatorSet {
+        let current = *borrow_global<ValidatorSet>(@supra_framework);
+        if (exists<PreviousValidatorSet>(@supra_framework)) {
+            borrow_global_mut<PreviousValidatorSet>(@supra_framework).validator_set = current;
+        } else {
+            move_to(
+                &create_signer(@supra_framework),
+                PreviousValidatorSet { validator_set: current }
+            );
+        }
+    }
+
+    /// Set DKG output keys for all provided threshold types.
+    /// Each DkgCommitteeOutput contains a threshold_type and corresponding keys for all validators.
+    ///
+    /// This is the only writer permitted to populate the BLS threshold key shares of a stored
+    /// consensus key; operator submissions carrying them are rejected by
+    /// `validate_consensus_public_key`. Note that it rotates only the threshold types present in
+    /// `committee_outputs`, so any other field keeps whatever it already held.
+    ///
+    /// Superseded by `set_dkg_output_keys_for_members`, which is the only caller path once this
+    /// version has been rolled out. **This function should then be changed to abort.** It cannot be
+    /// deleted - removing a published function is not an upgrade-compatible change - but replacing
+    /// its body is, and leaving it callable keeps a second way to install threshold keys that
+    /// recomputes the validator set instead of using the one the session pinned. Tracked as
+    /// smr-moonshot issue 3345.
+    public(friend) fun set_dkg_output_keys(
+        committee_outputs: vector<dkg_committee::DkgCommitteeOutput>
+    ) acquires ValidatorConfig, ValidatorSet, StakePool {
+        if (vector::is_empty(&committee_outputs)) { return };
+
+        let next_validator_infos = next_validator_consensus_infos();
+        let validator_addrs = vector[];
+        vector::for_each_ref(
+            &next_validator_infos,
+            |val_info| vector::push_back(
+                &mut validator_addrs, validator_consensus_info::get_addr(val_info)
+            )
+        );
+        set_dkg_output_keys_internal(validator_addrs, committee_outputs);
+    }
+
+    /// Set DKG output keys for all provided threshold types, against the validator ordering the DKG
+    /// session pinned when it started.
+    ///
+    /// Prefer this to `set_dkg_output_keys`, which recomputes the next validator set here at the end
+    /// of the session instead. That recomputation is a different code path from the one that
+    /// produced the session's target committee, so the two can disagree on either membership or
+    /// ordering: a length disagreement aborts, which fails the block on every node, and an ordering
+    /// disagreement silently installs each validator's key share on a different validator.
+    public(friend) fun set_dkg_output_keys_for_members(
+        validator_addrs: vector<address>,
+        committee_outputs: vector<dkg_committee::DkgCommitteeOutput>
+    ) acquires ValidatorConfig, StakePool {
+        if (vector::is_empty(&committee_outputs)) { return };
+        set_dkg_output_keys_internal(validator_addrs, committee_outputs);
+    }
+
+    fun set_dkg_output_keys_internal(
+        validator_addrs: vector<address>,
+        committee_outputs: vector<dkg_committee::DkgCommitteeOutput>
+    ) acquires ValidatorConfig, StakePool {
+        let num_validators = vector::length(&validator_addrs);
+
+        // Validate the structure of every committee output before any validator's key is written:
+        // one key share per validator, and a threshold type a key can be installed for.
+        let num_outputs = vector::length(&committee_outputs);
+        let j = 0;
+        while (j < num_outputs) {
+            let output = vector::borrow(&committee_outputs, j);
+            assert!(
+                num_validators
+                    == vector::length(
+                        &dkg_committee::get_dkg_committee_output_keys(output)
+                    ),
+                error::invalid_argument(EDKG_INVALID_PK_SHARES)
+            );
+            assert!(
+                validator_public_keys::is_installable_threshold_type(
+                    dkg_committee::get_dkg_committee_output_threshold_type(output)
+                ),
+                error::invalid_argument(EDKG_UNINSTALLABLE_THRESHOLD_TYPE)
+            );
+            j = j + 1;
+        };
+
+        // Iterate over each validator
+        let i = 0;
+        while (i < num_validators) {
+            let addr = *vector::borrow(&validator_addrs, i);
+            let validator_config = borrow_global_mut<ValidatorConfig>(addr);
+            let old_consensus_pubkey = validator_config.consensus_pubkey;
+
+            // Load current public keys
+            let pub_keys =
+                validator_public_keys::validator_public_keys_from_bytes(
+                    old_consensus_pubkey
+                );
+
+            // Apply all threshold key updates for this validator
+            let k = 0;
+            while (k < num_outputs) {
+                let output = vector::borrow(&committee_outputs, k);
+                let output_keys = dkg_committee::get_dkg_committee_output_keys(output);
+                let key_bytes = vector::borrow(&output_keys, i);
+
+                // Deserialize the key.
+                //
+                // This check, and the threshold-tag check in the validation loop above, are also
+                // made in Rust: before a payload reaches `supra_dkg::finish`, the VM's DKG admission
+                // gate range-checks every tag and refuses every commitment point that
+                // `public_key_from_bytes` refuses (an encoding outside the prime-order subgroup, and
+                // the identity), so on a current binary this pair is unreachable via the DKG path.
+                //
+                // Keep them anyway. They are the only copy that lives in the framework rather than
+                // in whichever binary a validator happens to run, so they are what still holds if a
+                // node runs one whose gate predates the check; and they are the only copy that sees
+                // what is actually being installed, since the gate validates the payload as signed,
+                // which is this vector before `supra_dkg::build_committee_outputs` slices it. A
+                // change to that slicing, or to the ordering between it and here, would not fail
+                // anywhere else. See Entropy-Foundation/smr-moonshot#3631.
+                let key_opt = aptos_std::bls12381::public_key_from_bytes(*key_bytes);
+                assert!(
+                    option::is_some(&key_opt),
+                    error::invalid_argument(EINVALID_PUBLIC_KEY)
+                );
+                let new_key = option::extract(&mut key_opt);
+
+                // Rotate the key based on threshold type
+                validator_public_keys::rotate_supra_bls_threshold_key_by_type(
+                    &mut pub_keys,
+                    dkg_committee::get_dkg_committee_output_threshold_type(output),
+                    new_key
+                );
+                k = k + 1;
+            };
+
+            // Serialize and save updated keys
+            let new_consensus_pubkey =
+                validator_public_keys::public_key_to_bytes(pub_keys);
+            validator_config.consensus_pubkey = new_consensus_pubkey;
+
+            // Emit events
+            let stake_pool = borrow_global_mut<StakePool>(addr);
+            if (std::features::module_event_migration_enabled()) {
+                event::emit(
+                    RotateConsensusKey {
+                        pool_address: addr,
+                        old_consensus_pubkey,
+                        new_consensus_pubkey
+                    }
+                );
+            };
+            event::emit_event(
+                &mut stake_pool.rotate_consensus_key_events,
+                RotateConsensusKeyEvent {
+                    pool_address: addr,
+                    old_consensus_pubkey,
+                    new_consensus_pubkey
+                }
+            );
+
+            i = i + 1;
+        };
+    }
+
+    /// Rotate the consensus key of the validator
+    /// does not verify proof of possession
+    /// only for genesis
+    public(friend) fun rotate_consensus_key_genesis(
+        operator: &signer, pool_address: address, new_consensus_pubkey: vector<u8>
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        rotate_consensus_key_internal(
+            operator,
+            pool_address,
+            new_consensus_pubkey,
+            true
+        );
+    }
+
+    /// Rotate the consensus key of the validator, it'll take effect in next epoch.
+    public entry fun rotate_consensus_key(
+        operator: &signer, pool_address: address, new_consensus_pubkey: vector<u8>
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        rotate_consensus_key_internal(
+            operator,
+            pool_address,
+            new_consensus_pubkey,
+            false
+        );
+    }
+
+    /// Update the network and full node addresses of the validator. This only takes effect in the next epoch.
+    public entry fun update_network_and_fullnode_addresses(
+        operator: &signer,
+        pool_address: address,
+        new_network_addresses: vector<u8>,
+        new_fullnode_addresses: vector<u8>
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        assert!(
+            signer::address_of(operator) == stake_pool.operator_address,
+            error::unauthenticated(ENOT_OPERATOR)
+        );
+        assert!(
+            exists<ValidatorConfig>(pool_address),
+            error::not_found(EVALIDATOR_CONFIG)
+        );
+        assert_network_addresses_unique_in_next_validator_set(
+            pool_address, &new_network_addresses
+        );
+        let validator_info = borrow_global_mut<ValidatorConfig>(pool_address);
+        let old_network_addresses = validator_info.network_addresses;
+        validator_info.network_addresses = new_network_addresses;
+        let old_fullnode_addresses = validator_info.fullnode_addresses;
+        validator_info.fullnode_addresses = new_fullnode_addresses;
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(
+                UpdateNetworkAndFullnodeAddresses {
+                    pool_address,
+                    old_network_addresses,
+                    new_network_addresses,
+                    old_fullnode_addresses,
+                    new_fullnode_addresses
+                }
+            );
+        };
+        event::emit_event(
+            &mut stake_pool.update_network_and_fullnode_addresses_events,
+            UpdateNetworkAndFullnodeAddressesEvent {
+                pool_address,
+                old_network_addresses,
+                new_network_addresses,
+                old_fullnode_addresses,
+                new_fullnode_addresses
+            }
+        );
+
+    }
+
+    /// Similar to increase_lockup_with_cap but will use ownership capability from the signing account.
+    public entry fun increase_lockup(owner: &signer) acquires OwnerCapability, StakePool {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        increase_lockup_with_cap(ownership_cap);
+    }
+
+    /// Unlock from active delegation, it's moved to pending_inactive if locked_until_secs < current_time or
+    /// directly inactive if it's not from an active validator.
+    public fun increase_lockup_with_cap(owner_cap: &OwnerCapability) acquires StakePool {
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let config = staking_config::get();
+
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let old_locked_until_secs = stake_pool.locked_until_secs;
+        let new_locked_until_secs =
+            timestamp::now_seconds()
+                + staking_config::get_recurring_lockup_duration(&config);
+        assert!(
+            old_locked_until_secs < new_locked_until_secs,
+            error::invalid_argument(EINVALID_LOCKUP)
+        );
+        stake_pool.locked_until_secs = new_locked_until_secs;
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(
+                IncreaseLockup {
+                    pool_address,
+                    old_locked_until_secs,
+                    new_locked_until_secs
+                }
+            );
+        };
+        event::emit_event(
+            &mut stake_pool.increase_lockup_events,
+            IncreaseLockupEvent {
+                pool_address,
+                old_locked_until_secs,
+                new_locked_until_secs
+            }
+        );
+    }
+
+    /// This can only called by the operator of the validator/staking pool.
+    public entry fun join_validator_set(
+        operator: &signer, pool_address: address
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        assert!(
+            staking_config::get_allow_validator_set_change(&staking_config::get()),
+            error::invalid_argument(ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED)
+        );
+
+        join_validator_set_internal(operator, pool_address);
+    }
+
+    /// Request to have `pool_address` join the validator set. Can only be called after calling `initialize_validator`.
+    /// If the validator has the required stake (more than minimum and less than maximum allowed), they will be
+    /// added to the pending_active queue. All validators in this queue will be added to the active set when the next
+    /// epoch starts (eligibility will be rechecked).
+    ///
+    /// This internal version can only be called by the Genesis module during Genesis.
+    public(friend) fun join_validator_set_internal(
+        operator: &signer, pool_address: address
+    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        assert!(
+            signer::address_of(operator) == stake_pool.operator_address,
+            error::unauthenticated(ENOT_OPERATOR)
+        );
+        assert!(
+            get_validator_state(pool_address) == VALIDATOR_STATUS_INACTIVE,
+            error::invalid_state(EALREADY_ACTIVE_VALIDATOR)
+        );
+
+        let config = staking_config::get();
+        let (minimum_stake, maximum_stake) = staking_config::get_required_stake(&config);
+        // Admission against the minimum is judged by the same stake-only rule the epoch
+        // boundary will apply (`next_epoch_base_voting_power`), so a validator whose
+        // expired-lockup pending_inactive stake is doing the lifting is rejected here with an
+        // actionable error instead of joining successfully and then never activating. The
+        // maximum bound and the joining-power budget still count the whole pool,
+        // conservatively.
+        let base_power =
+            next_epoch_base_voting_power(stake_pool, timestamp::now_seconds());
+        assert!(base_power >= minimum_stake, error::invalid_argument(ESTAKE_TOO_LOW));
+        let voting_power = get_next_epoch_voting_power(stake_pool);
+        assert!(voting_power <= maximum_stake, error::invalid_argument(ESTAKE_TOO_HIGH));
+
+        // Track and validate voting power increase.
+        update_voting_power_increase(voting_power);
+
+        // Add validator to pending_active, to be activated in the next epoch. The config is copied
+        // out of global storage rather than held by reference because the uniqueness check below
+        // borrows the `ValidatorConfig` of every validator in the next set.
+        let validator_config = *borrow_global<ValidatorConfig>(pool_address);
+        assert!(
+            !vector::is_empty(&validator_config.consensus_pubkey),
+            error::invalid_argument(EINVALID_PUBLIC_KEY)
+        );
+        // While the v2 identity format is required (see `is_unrotated_legacy_key`),
+        // `is_eligible_active_validator` would silently drop a legacy-format key at every epoch
+        // boundary anyway; reject it here so the operator gets an actionable error at join time
+        // instead of a validator that joins successfully and then never activates.
+        assert!(
+            !is_unrotated_legacy_key(&validator_config.consensus_pubkey),
+            error::invalid_state(EUNROTATED_LEGACY_CONSENSUS_KEY)
+        );
+        // Consensus-key uniqueness holds over the next validator set as a whole, so every path by
+        // which a key enters that set enforces it. Registration and rotation check the key they are
+        // handed; joining supplies no key material, so the stored key is checked here, at the point
+        // it enters the set. Costs one O(n) scan on a path that is already O(n).
+        assert_consensus_pubkey_unique_in_next_validator_set(
+            pool_address, &validator_config.consensus_pubkey
+        );
+
+        // Validate the current validator set size has not exceeded the limit.
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        vector::push_back(
+            &mut validator_set.pending_active,
+            generate_validator_info(pool_address, stake_pool, validator_config)
+        );
+        let validator_set_size = vector::length(&validator_set.active_validators)
+            + vector::length(&validator_set.pending_active);
+        assert!(
+            validator_set_size <= MAX_VALIDATOR_SET_SIZE,
+            error::invalid_argument(EVALIDATOR_SET_TOO_LARGE)
+        );
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(JoinValidatorSet { pool_address });
+        };
+        event::emit_event(
+            &mut stake_pool.join_validator_set_events,
+            JoinValidatorSetEvent { pool_address }
+        );
+    }
+
+    /// Similar to unlock_with_cap but will use ownership capability from the signing account.
+    public entry fun unlock(owner: &signer, amount: u64) acquires OwnerCapability, StakePool {
+        assert_reconfig_not_in_progress();
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        unlock_with_cap(amount, ownership_cap);
+    }
+
+    /// Unlock `amount` from the active stake. Only possible if the lockup has expired.
+    public fun unlock_with_cap(amount: u64, owner_cap: &OwnerCapability) acquires StakePool {
+        assert_reconfig_not_in_progress();
+        // Short-circuit if amount to unlock is 0 so we don't emit events.
+        if (amount == 0) { return };
+
+        // Unlocked coins are moved to pending_inactive. When the current lockup cycle expires, they will be moved into
+        // inactive in the earliest possible epoch transition.
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        // Cap amount to unlock by maximum active stake.
+        let amount = min(amount, coin::value(&stake_pool.active));
+        let unlocked_stake = coin::extract(&mut stake_pool.active, amount);
+        coin::merge<SupraCoin>(&mut stake_pool.pending_inactive, unlocked_stake);
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(UnlockStake { pool_address, amount_unlocked: amount });
+        };
+        event::emit_event(
+            &mut stake_pool.unlock_stake_events,
+            UnlockStakeEvent { pool_address, amount_unlocked: amount }
+        );
+    }
+
+    /// Withdraw from `account`'s inactive stake.
+    public entry fun withdraw(
+        owner: &signer, withdraw_amount: u64
+    ) acquires OwnerCapability, StakePool, ValidatorSet {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        let coins = withdraw_with_cap(ownership_cap, withdraw_amount);
+        coin::deposit<SupraCoin>(owner_address, coins);
+    }
+
+    /// Withdraw from `pool_address`'s inactive stake with the corresponding `owner_cap`.
+    public fun withdraw_with_cap(
+        owner_cap: &OwnerCapability, withdraw_amount: u64
+    ): Coin<SupraCoin> acquires StakePool, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        // There's an edge case where a validator unlocks their stake and leaves the validator set before
+        // the stake is fully unlocked (the current lockup cycle has not expired yet).
+        // This can leave their stake stuck in pending_inactive even after the current lockup cycle expires.
+        if (get_validator_state(pool_address) == VALIDATOR_STATUS_INACTIVE
+            && timestamp::now_seconds() >= stake_pool.locked_until_secs) {
+            let pending_inactive_stake =
+                coin::extract_all(&mut stake_pool.pending_inactive);
+            coin::merge(&mut stake_pool.inactive, pending_inactive_stake);
+        };
+
+        // Cap withdraw amount by total inactive coins.
+        withdraw_amount = min(withdraw_amount, coin::value(&stake_pool.inactive));
+        if (withdraw_amount == 0) return coin::zero<SupraCoin>();
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(WithdrawStake { pool_address, amount_withdrawn: withdraw_amount });
+        };
+        event::emit_event(
+            &mut stake_pool.withdraw_stake_events,
+            WithdrawStakeEvent { pool_address, amount_withdrawn: withdraw_amount }
+        );
+
+        coin::extract(&mut stake_pool.inactive, withdraw_amount)
+    }
+
+    /// Request to have `pool_address` leave the validator set. The validator is only actually removed from the set when
+    /// the next epoch starts.
+    /// The last validator in the set cannot leave. This is an edge case that should never happen as long as the network
+    /// is still operational.
+    ///
+    /// Can only be called by the operator of the validator/staking pool.
+    public entry fun leave_validator_set(
+        operator: &signer, pool_address: address
+    ) acquires StakePool, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        let config = staking_config::get();
+        assert!(
+            staking_config::get_allow_validator_set_change(&config),
+            error::invalid_argument(ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED)
+        );
+
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        // Account has to be the operator.
+        assert!(
+            signer::address_of(operator) == stake_pool.operator_address,
+            error::unauthenticated(ENOT_OPERATOR)
+        );
+
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        // If the validator is still pending_active, directly kick the validator out.
+        let maybe_pending_active_index =
+            find_validator(&validator_set.pending_active, pool_address);
+        if (option::is_some(&maybe_pending_active_index)) {
+            vector::swap_remove(
+                &mut validator_set.pending_active,
+                option::extract(&mut maybe_pending_active_index)
+            );
+
+            // Decrease the voting power increase as the pending validator's voting power was added when they requested
+            // to join. Now that they changed their mind, their voting power should not affect the joining limit of this
+            // epoch.
+            let validator_stake = (get_next_epoch_voting_power(stake_pool) as u128);
+            // total_joining_power should be larger than validator_stake but just in case there has been a small
+            // rounding error somewhere that can lead to an underflow, we still want to allow this transaction to
+            // succeed.
+            if (validator_set.total_joining_power > validator_stake) {
+                validator_set.total_joining_power =
+                    validator_set.total_joining_power - validator_stake;
+            } else {
+                validator_set.total_joining_power = 0;
+            };
+        } else {
+            // Validate that the validator is already part of the validator set.
+            let maybe_active_index =
+                find_validator(&validator_set.active_validators, pool_address);
+            assert!(
+                option::is_some(&maybe_active_index),
+                error::invalid_state(ENOT_VALIDATOR)
+            );
+            let validator_info = vector::swap_remove(
+                &mut validator_set.active_validators,
+                option::extract(&mut maybe_active_index)
+            );
+            assert!(
+                vector::length(&validator_set.active_validators) != 0,
+                error::invalid_state(ELAST_VALIDATOR)
+            );
+            vector::push_back(&mut validator_set.pending_inactive, validator_info);
+
+            if (std::features::module_event_migration_enabled()) {
+                event::emit(LeaveValidatorSet { pool_address });
+            };
+            event::emit_event(
+                &mut stake_pool.leave_validator_set_events,
+                LeaveValidatorSetEvent { pool_address }
+            );
+        };
+    }
+
+    /// Returns true if the current validator can still vote in the current epoch.
+    /// This includes validators that requested to leave but are still in the pending_inactive queue and will be removed
+    /// when the epoch starts.
+    public fun is_current_epoch_validator(pool_address: address): bool acquires ValidatorSet {
+        assert_stake_pool_exists(pool_address);
+        let validator_state = get_validator_state(pool_address);
+        validator_state == VALIDATOR_STATUS_ACTIVE
+            || validator_state == VALIDATOR_STATUS_PENDING_INACTIVE
+    }
+
+    /// Update the validator performance (proposal statistics). This is only called by block::prologue().
+    /// This function cannot abort.
+    public(friend) fun update_performance_statistics(
+        proposer_index: Option<u64>, failed_proposer_indices: vector<u64>
+    ) acquires ValidatorPerformance {
+        // Validator set cannot change until the end of the epoch, so the validator index in arguments should
+        // match with those of the validators in ValidatorPerformance resource.
+        let validator_perf = borrow_global_mut<ValidatorPerformance>(@supra_framework);
+        let validator_len = vector::length(&validator_perf.validators);
+
+        spec {};
+        // proposer_index is an option because it can be missing (for NilBlocks)
+        if (option::is_some(&proposer_index)) {
+            let cur_proposer_index = option::extract(&mut proposer_index);
+            // Here, and in all other vector::borrow, skip any validator indices that are out of bounds,
+            // this ensures that this function doesn't abort if there are out of bounds errors.
+            if (cur_proposer_index < validator_len) {
+                let validator = vector::borrow_mut(
+                    &mut validator_perf.validators, cur_proposer_index
+                );
+                spec {};
+                validator.successful_proposals = validator.successful_proposals + 1;
+            };
+        };
+
+        let f = 0;
+        let f_len = vector::length(&failed_proposer_indices);
+        while ({
+            spec {};
+            f < f_len
+        }) {
+            let validator_index = *vector::borrow(&failed_proposer_indices, f);
+            if (validator_index < validator_len) {
+                let validator = vector::borrow_mut(
+                    &mut validator_perf.validators, validator_index
+                );
+                spec {};
+                validator.failed_proposals = validator.failed_proposals + 1;
+            };
+            f = f + 1;
+        };
+    }
+
+    /// Triggered during a reconfiguration. This function shouldn't abort.
+    ///
+    /// 1. Distribute transaction fees and rewards to stake pools of active and pending inactive validators (requested
+    /// to leave but not yet removed).
+    /// 2. Officially move pending active stake to active and move pending inactive stake to inactive.
+    /// The staking pool's voting power in this new epoch will be updated to the total active stake.
+    /// 3. Add pending active validators to the active set if they satisfy requirements so they can vote and remove
+    /// pending inactive validators so they no longer can vote.
+    /// 4. The validator's voting power in the validator set is updated to be the corresponding staking pool's voting
+    /// power.
+    public(friend) fun on_new_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        archive_current_validator_set();
+
+        // Compute the next validator set before mutating any state. This is the same code
+        // path that produced the DKG receiver committee at DKG start, and its every input is
+        // frozen while the reconfiguration is in progress, so it returns the same set here as
+        // it did there (see `compute_next_validator_set_internal`). It must run first because
+        // it reads the pre-reward stake-pool balances.
+        let ValidatorSet {
+            consensus_scheme: _,
+            active_validators: next_epoch_validators,
+            pending_inactive: _,
+            pending_active: _,
+            total_voting_power: next_epoch_total_voting_power,
+            total_joining_power: _
+        } = compute_next_validator_set_internal(false);
+
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        let config = staking_config::get();
+        let validator_perf = borrow_global_mut<ValidatorPerformance>(@supra_framework);
+
+        // Process pending stake and distribute transaction fees and rewards for each currently active validator.
+        vector::for_each_ref(
+            &validator_set.active_validators,
+            |validator| {
+                let validator: &ValidatorInfo = validator;
+                update_stake_pool(validator_perf, validator.addr, &config);
+            }
+        );
+
+        // Process pending stake and distribute transaction fees and rewards for each currently pending_inactive validator
+        // (requested to leave but not removed yet).
+        vector::for_each_ref(
+            &validator_set.pending_inactive,
+            |validator| {
+                let validator: &ValidatorInfo = validator;
+                update_stake_pool(validator_perf, validator.addr, &config);
+            }
+        );
+
+        // Commit the computed next validator set. Activation of pending_active validators,
+        // removal of pending_inactive validators, eligibility filtering (minimum stake and
+        // valid consensus key), ordering, and voting powers are all reflected in the
+        // computed membership, so network address/public key changes take effect here.
+        validator_set.active_validators = next_epoch_validators;
+        validator_set.pending_active = vector::empty();
+        validator_set.pending_inactive = vector::empty();
+        validator_set.total_voting_power = next_epoch_total_voting_power;
+        validator_set.total_joining_power = 0;
+
+        // Update validator indices, reset performance scores, and renew lockups.
+        validator_perf.validators = vector::empty();
+        let recurring_lockup_duration_secs =
+            staking_config::get_recurring_lockup_duration(&config);
+        let vlen = vector::length(&validator_set.active_validators);
+        let validator_index = 0;
+        while ({
+            spec {};
+            validator_index < vlen
+        }) {
+            // The embedded `config.validator_index` was already assigned by
+            // `compute_next_validator_set_internal`; only the global `ValidatorConfig`
+            // still needs to be updated.
+            let validator_info = vector::borrow(
+                &validator_set.active_validators, validator_index
+            );
+            let validator_config =
+                borrow_global_mut<ValidatorConfig>(validator_info.addr);
+            validator_config.validator_index = validator_index;
+
+            vector::push_back(
+                &mut validator_perf.validators,
+                IndividualValidatorPerformance {
+                    successful_proposals: 0,
+                    failed_proposals: 0
+                }
+            );
+
+            // Automatically renew a validator's lockup for validators that will still be in the validator set in the
+            // next epoch.
+            let stake_pool = borrow_global_mut<StakePool>(validator_info.addr);
+            let now_secs = timestamp::now_seconds();
+            let reconfig_start_secs =
+                if (chain_status::is_operating()) {
+                    get_reconfig_start_time_secs()
+                } else {
+                    now_secs
+                };
+            if (stake_pool.locked_until_secs <= reconfig_start_secs) {
+                spec {};
+                stake_pool.locked_until_secs = now_secs
+                    + recurring_lockup_duration_secs;
+            };
+
+            validator_index = validator_index + 1;
+        };
+
+        if (features::periodical_reward_rate_decrease_enabled()) {
+            // Update rewards rate after reward distribution.
+            staking_config::calculate_and_save_latest_epoch_rewards_rate();
+        };
+    }
+
+    /// Return the `ValidatorConsensusInfo` of each current validator, sorted by current validator index.
+    public fun cur_validator_consensus_infos(): vector<ValidatorConsensusInfo> acquires ValidatorSet {
+        let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        validator_consensus_infos_from_validator_set(validator_set)
+    }
+
+    public fun next_validator_consensus_infos(): vector<ValidatorConsensusInfo> acquires ValidatorSet, StakePool, ValidatorConfig {
+        let new_validator_set = compute_next_validator_set_internal(false);
+        validator_consensus_infos_from_validator_set(&new_validator_set)
+    }
+
+    /// Same as `next_validator_consensus_infos` but uses the current-epoch config data for
+    /// validators that are already active. This is used when starting DKG: the committee
+    /// membership (active + pending_active) must reflect the next epoch, but node config
+    /// should reflect current-epoch for the active validators to ensure that validators that update
+    /// their configuration do not need to run two copies of themselves to participate in DKG.
+    public fun next_epoch_validator_consensus_infos_for_dkg(): vector<ValidatorConsensusInfo> acquires ValidatorSet, StakePool, ValidatorConfig {
+        // Use the current-epoch config snapshot for active validators so mid-epoch config changes
+        // do not take effect during DKG (use_current_config_for_actives=true).
+        let new_validator_set = compute_next_validator_set_internal(true);
+        validator_consensus_infos_from_validator_set(&new_validator_set)
+    }
+
+    /// Computes the validator set for the next epoch.
+    ///
+    /// `use_current_config_for_actives`: when `true`, currently-active validators retain their
+    /// current-epoch `ValidatorConfig` snapshot instead of reading the latest on-chain value.
+    /// New joiners (`pending_active`) always read from `ValidatorConfig` regardless of this flag.
+    ///
+    /// This is the single code path for next-epoch membership, ordering, voting power and
+    /// validator indices: `on_new_epoch` commits the set returned here (with the latest
+    /// configs), and the DKG receiver committee previews it (with snapshotted configs), so the
+    /// two cannot diverge structurally.
+    ///
+    /// Voting power - and with it eligibility - is stake alone, never rewards or fees.
+    /// `block_prologue` advances `ValidatorPerformance` and the `ValidatorFees` table on
+    /// every block with no reconfiguration guard, so those were the only inputs that could
+    /// move between a preview taken at DKG start and the commit at the epoch boundary; stake
+    /// movements, joins, leaves and key rotations are all frozen for the whole
+    /// reconfiguration. With rewards and fees out of the computation entirely (they are paid
+    /// into the pools at the boundary and count from the next epoch), the returned set -
+    /// membership, ordering, validator indices AND voting powers - is identical across the
+    /// two reads.
+    ///
+    /// `pending_active` joiners are appended after the current actives, in reverse insertion
+    /// order (a legacy of the `pop_back`-based append historically used by `on_new_epoch`,
+    /// preserved for continuity).
+    fun compute_next_validator_set_internal(
+        use_current_config_for_actives: bool
+    ): ValidatorSet acquires ValidatorSet, StakePool, ValidatorConfig {
+        // Init.
+        let cur_validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        let staking_config = staking_config::get();
+        let (minimum_stake, _) = staking_config::get_required_stake(&staking_config);
+
+        // Compute new validator set.
+        let new_active_validators = vector[];
+        let num_new_actives = 0;
+        let candidate_idx = 0;
+        let new_total_power = 0;
+        let num_cur_actives = vector::length(&cur_validator_set.active_validators);
+        let num_cur_pending_actives = vector::length(&cur_validator_set.pending_active);
+        spec {};
+        let num_candidates = num_cur_actives + num_cur_pending_actives;
+
+        while ({
+            spec {};
+            candidate_idx < num_candidates
+        }) {
+            let candidate_in_current_validator_set = candidate_idx < num_cur_actives;
+            let candidate =
+                if (candidate_idx < num_cur_actives) {
+                    vector::borrow(&cur_validator_set.active_validators, candidate_idx)
+                } else {
+                    let pending_idx =
+                        num_cur_pending_actives - 1 - (candidate_idx - num_cur_actives);
+                    vector::borrow(&cur_validator_set.pending_active, pending_idx)
+                };
+            let stake_pool = borrow_global<StakePool>(candidate.addr);
+            // Voting power is stake alone. Rewards and fees are paid into the pool by
+            // `update_stake_pool` at the boundary and count from the *next* epoch, when they
+            // are part of `active`. Every term is frozen while a reconfiguration is in
+            // progress, so the set this function returns is identical whether it is computed
+            // at DKG start or at the epoch boundary.
+            let new_voting_power =
+                next_epoch_base_voting_power(stake_pool, get_reconfig_start_time_secs());
+
+            let config =
+                if (use_current_config_for_actives
+                    && candidate_in_current_validator_set) {
+                    // Use the current-epoch config snapshot so that any mid-epoch changes
+                    // (consensus key, network addresses, etc.) only take effect after the
+                    // epoch transition, not during DKG.
+                    candidate.config
+                } else {
+                    *borrow_global<ValidatorConfig>(candidate.addr)
+                };
+
+            // This single filter decides membership for both the DKG receiver committee /
+            // `set_dkg_output_keys` preview and the set committed by `on_new_epoch`.
+            // validator_index stays contiguous because it is only advanced for included
+            // validators. Rewards and fees never enter the comparison, so they cannot flip
+            // membership between the two reads (nor rescue a validator whose stake alone is
+            // below the minimum).
+            if (is_eligible_active_validator(
+                new_voting_power, minimum_stake, &config.consensus_pubkey
+            )) {
+                config.validator_index = num_new_actives;
+                let new_validator_info = ValidatorInfo {
+                    addr: candidate.addr,
+                    voting_power: new_voting_power,
+                    config
+                };
+
+                // Update ValidatorSet.
+                spec {};
+                new_total_power = new_total_power + (new_voting_power as u128);
+                vector::push_back(&mut new_active_validators, new_validator_info);
+                num_new_actives = num_new_actives + 1;
+            };
+
+            candidate_idx = candidate_idx + 1;
+        };
+
+        ValidatorSet {
+            consensus_scheme: cur_validator_set.consensus_scheme,
+            active_validators: new_active_validators,
+            pending_inactive: vector[],
+            pending_active: vector[],
+            total_voting_power: new_total_power,
+            total_joining_power: 0
+        }
+    }
+
+    fun validator_consensus_infos_from_validator_set(
+        validator_set: &ValidatorSet
+    ): vector<ValidatorConsensusInfo> {
+        let validator_consensus_infos = vector[];
+
+        let num_active = vector::length(&validator_set.active_validators);
+        let num_pending_inactive = vector::length(&validator_set.pending_inactive);
+        spec {};
+        let total = num_active + num_pending_inactive;
+
+        // Pre-fill the return value with dummy values.
+        let idx = 0;
+        while ({
+            spec {};
+            idx < total
+        }) {
+            vector::push_back(
+                &mut validator_consensus_infos, validator_consensus_info::default()
+            );
+            idx = idx + 1;
+        };
+        spec {};
+
+        vector::for_each_ref(
+            &validator_set.active_validators,
+            |obj| {
+                let vi: &ValidatorInfo = obj;
+                spec {};
+                let vci = vector::borrow_mut(
+                    &mut validator_consensus_infos, vi.config.validator_index
+                );
+                *vci = validator_consensus_info::new(
+                    vi.addr,
+                    vi.config.consensus_pubkey,
+                    vi.voting_power
+                );
+                spec {};
+            }
+        );
+
+        vector::for_each_ref(
+            &validator_set.pending_inactive,
+            |obj| {
+                let vi: &ValidatorInfo = obj;
+                spec {};
+                let vci = vector::borrow_mut(
+                    &mut validator_consensus_infos, vi.config.validator_index
+                );
+                *vci = validator_consensus_info::new(
+                    vi.addr,
+                    vi.config.consensus_pubkey,
+                    vi.voting_power
+                );
+                spec {};
+            }
+        );
+
+        validator_consensus_infos
+    }
+
+    fun addresses_from_validator_infos(infos: &vector<ValidatorInfo>): vector<address> {
+        vector::map_ref(
+            infos,
+            |obj| {
+                let info: &ValidatorInfo = obj;
+                info.addr
+            }
+        )
+    }
+
+    /// Calculate the stake amount of a stake pool for the next epoch.
+    /// Update individual validator's stake pool if `commit == true`.
+    ///
+    /// 1. distribute transaction fees to active/pending_inactive delegations
+    /// 2. distribute rewards to active/pending_inactive delegations
+    /// 3. process pending_active, pending_inactive correspondingly
+    /// This function shouldn't abort.
+    fun update_stake_pool(
+        validator_perf: &ValidatorPerformance,
+        pool_address: address,
+        staking_config: &StakingConfig
+    ) acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorFees {
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        let cur_validator_perf = vector::borrow(
+            &validator_perf.validators, validator_config.validator_index
+        );
+        let num_successful_proposals = cur_validator_perf.successful_proposals;
+        spec {};
+        let num_total_proposals =
+            cur_validator_perf.successful_proposals
+                + cur_validator_perf.failed_proposals;
+        let (rewards_rate, rewards_rate_denominator) =
+            staking_config::get_reward_rate(staking_config);
+        let rewards_active =
+            distribute_rewards(
+                &mut stake_pool.active,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        let rewards_pending_inactive =
+            distribute_rewards(
+                &mut stake_pool.pending_inactive,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        spec {};
+        let rewards_amount = rewards_active + rewards_pending_inactive;
+        // Pending active stake can now be active.
+        coin::merge(
+            &mut stake_pool.active, coin::extract_all(&mut stake_pool.pending_active)
+        );
+
+        // Additionally, distribute transaction fees.
+        if (features::collect_and_distribute_gas_fees()) {
+            let fees_table =
+                &mut borrow_global_mut<ValidatorFees>(@supra_framework).fees_table;
+            if (table::contains(fees_table, pool_address)) {
+                let coin = table::remove(fees_table, pool_address);
+                coin::merge(&mut stake_pool.active, coin);
+            };
+        };
+
+        // Pending inactive stake is only fully unlocked and moved into inactive if the current lockup cycle has expired
+        let current_lockup_expiration = stake_pool.locked_until_secs;
+        if (get_reconfig_start_time_secs() >= current_lockup_expiration) {
+            coin::merge(
+                &mut stake_pool.inactive,
+                coin::extract_all(&mut stake_pool.pending_inactive)
+            );
+        };
+
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(DistributeRewards { pool_address, rewards_amount });
+        };
+        event::emit_event(
+            &mut stake_pool.distribute_rewards_events,
+            DistributeRewardsEvent { pool_address, rewards_amount }
+        );
+    }
+
+    /// The start time of the reconfiguration in progress (immediate or async), or the current time
+    /// when none is in progress.
+    ///
+    /// The predicate must be `is_in_progress()`, not `is_initialized()`. `reconfiguration_state`
+    /// creates its `State` resource in the *inactive* variant, so `is_initialized()` is true from
+    /// genesis onwards, while `start_time_secs()` aborts with `ERECONFIG_NOT_IN_PROGRESS` unless the
+    /// variant is active. The two disagree wherever this is reached outside a reconfiguration, and
+    /// `genesis.move`'s `set_genesis_end` is exactly that: it calls `stake::on_new_epoch()` directly
+    /// rather than through `reconfiguration::reconfigure()`, which is what starts the state.
+    fun get_reconfig_start_time_secs(): u64 {
+        if (reconfiguration_state::is_in_progress()) {
+            reconfiguration_state::start_time_secs()
+        } else {
+            timestamp::now_seconds()
+        }
+    }
+
+    /// Calculate the rewards amount.
+    fun calculate_rewards_amount(
+        stake_amount: u64,
+        num_successful_proposals: u64,
+        num_total_proposals: u64,
+        rewards_rate: u64,
+        rewards_rate_denominator: u64
+    ): u64 {
+        spec {};
+        // The rewards amount is equal to (stake amount * rewards rate * performance multiplier).
+        // We do multiplication in u128 before division to avoid the overflow and minimize the rounding error.
+        let rewards_numerator =
+            (stake_amount as u128) * (rewards_rate as u128)
+                * (num_successful_proposals as u128);
+        let rewards_denominator =
+            (rewards_rate_denominator as u128) * (num_total_proposals as u128);
+        if (rewards_denominator != 0) {
+            ((rewards_numerator / rewards_denominator) as u64)
+        } else { 0 }
+    }
+
+    /// Mint rewards corresponding to current epoch's `stake` and `num_successful_votes`.
+    fun distribute_rewards(
+        stake: &mut Coin<SupraCoin>,
+        num_successful_proposals: u64,
+        num_total_proposals: u64,
+        rewards_rate: u64,
+        rewards_rate_denominator: u64
+    ): u64 acquires SupraCoinCapabilities {
+        let stake_amount = coin::value(stake);
+        let rewards_amount =
+            if (stake_amount != 0) {
+                calculate_rewards_amount(
+                    stake_amount,
+                    num_successful_proposals,
+                    num_total_proposals,
+                    rewards_rate,
+                    rewards_rate_denominator
+                )
+            } else { 0 };
+        if (rewards_amount != 0) {
+            let mint_cap =
+                &borrow_global<SupraCoinCapabilities>(@supra_framework).mint_cap;
+            let rewards = coin::mint(rewards_amount, mint_cap);
+            coin::merge(stake, rewards);
+        };
+        rewards_amount
+    }
+
+    fun find_validator(v: &vector<ValidatorInfo>, addr: address): Option<u64> {
+        let i = 0;
+        let len = vector::length(v);
+        while ({
+            spec {};
+            i < len
+        }) {
+            if (vector::borrow(v, i).addr == addr) {
+                return option::some(i)
+            };
+            i = i + 1;
+        };
+        option::none()
+    }
+
+    fun generate_validator_info(
+        addr: address, stake_pool: &StakePool, config: ValidatorConfig
+    ): ValidatorInfo {
+        let voting_power = get_next_epoch_voting_power(stake_pool);
+        ValidatorInfo { addr, voting_power, config }
+    }
+
+    /// Returns validator's next epoch voting power, including pending_active, active, and pending_inactive stake.
+    fun get_next_epoch_voting_power(stake_pool: &StakePool): u64 {
+        let value_pending_active = coin::value(&stake_pool.pending_active);
+        let value_active = coin::value(&stake_pool.active);
+        let value_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        spec {};
+        value_pending_active + value_active + value_pending_inactive
+    }
+
+    /// A validator's next-epoch voting power: stake alone - active + pending_active +
+    /// pending_inactive whose lockup has not expired as of `as_of_secs`. Rewards and fees
+    /// never count; they are paid into the pool at the epoch boundary and become part of
+    /// `active` (so they count from the epoch after).
+    ///
+    /// Joiners are judged by the same rule as continuing validators: pending_inactive stake
+    /// with an expired lockup contributes nothing, even though a joiner's pool has not had
+    /// that bucket moved to inactive yet. The move happens in the joiner's first
+    /// `update_stake_pool` after activation, so the stake never becomes active voting stake
+    /// unless the owner reactivates it first.
+    ///
+    /// This is the single rule applied by both the boundary filter in
+    /// `compute_next_validator_set_internal` and `join_validator_set`'s admission gate, so
+    /// the gate cannot admit a validator the boundary will drop.
+    fun next_epoch_base_voting_power(stake_pool: &StakePool, as_of_secs: u64): u64 {
+        let cur_active = coin::value(&stake_pool.active);
+        let cur_pending_active = coin::value(&stake_pool.pending_active);
+        let cur_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        spec {};
+        cur_active
+            + if (as_of_secs >= stake_pool.locked_until_secs) { 0 }
+            else {
+                cur_pending_inactive
+            } + cur_pending_active
+    }
+
+    fun update_voting_power_increase(increase_amount: u64) acquires ValidatorSet {
+        let validator_set = borrow_global_mut<ValidatorSet>(@supra_framework);
+        let voting_power_increase_limit =
+            (
+                staking_config::get_voting_power_increase_limit(&staking_config::get()) as u128
+            );
+        validator_set.total_joining_power =
+            validator_set.total_joining_power + (increase_amount as u128);
+
+        // Only validator voting power increase if the current validator set's voting power > 0.
+        if (validator_set.total_voting_power != 0) {
+            assert!(
+                validator_set.total_joining_power
+                    <= validator_set.total_voting_power * voting_power_increase_limit
+                        / 100,
+                error::invalid_argument(EVOTING_POWER_INCREASE_EXCEEDS_LIMIT)
+            );
+        }
+    }
+
+    fun assert_stake_pool_exists(pool_address: address) {
+        assert!(
+            stake_pool_exists(pool_address),
+            error::invalid_argument(ESTAKE_POOL_DOES_NOT_EXIST)
+        );
+    }
+
+    /// This provides an ACL for Testnet purposes. In testnet, everyone is a whale, a whale can be a validator.
+    /// This allows a testnet to bring additional entities into the validator set without compromising the
+    /// security of the testnet. This will NOT be enabled in Mainnet.
+    struct AllowedValidators has key {
+        accounts: vector<address>
+    }
+
+    public fun configure_allowed_validators(
+        supra_framework: &signer, accounts: vector<address>
+    ) acquires AllowedValidators {
+        let supra_framework_address = signer::address_of(supra_framework);
+        system_addresses::assert_supra_framework(supra_framework);
+        if (!exists<AllowedValidators>(supra_framework_address)) {
+            move_to(supra_framework, AllowedValidators { accounts });
+        } else {
+            let allowed = borrow_global_mut<AllowedValidators>(supra_framework_address);
+            allowed.accounts = accounts;
+        }
+    }
+
+    fun is_allowed(account: address): bool acquires AllowedValidators {
+        if (!exists<AllowedValidators>(@supra_framework)) { true }
+        else {
+            let allowed = borrow_global<AllowedValidators>(@supra_framework);
+            vector::contains(&allowed.accounts, &account)
+        }
+    }
+
+    fun assert_owner_cap_exists(owner: address) {
+        assert!(
+            exists<OwnerCapability>(owner),
+            error::not_found(EOWNER_CAP_NOT_FOUND)
+        );
+    }
+
+    fun assert_reconfig_not_in_progress() {
+        assert!(
+            !reconfiguration_state::is_in_progress(),
+            error::invalid_state(ERECONFIGURATION_IN_PROGRESS)
+        );
+    }
+
+    #[test_only]
+    use supra_framework::supra_coin;
+    use supra_framework::reconfiguration_state;
+    use supra_framework::validator_consensus_info;
+    use supra_framework::validator_consensus_info::ValidatorConsensusInfo;
+    #[test_only]
+    use aptos_std::fixed_point64;
+    #[test_only]
+    use aptos_std::bls12381;
+
+    #[test_only]
+    const EPOCH_DURATION: u64 = 60;
+
+    #[test_only]
+    const LOCKUP_CYCLE_SECONDS: u64 = 3600;
+
+    #[test_only]
+    public fun initialize_for_test(supra_framework: &signer) {
+        reconfiguration_state::initialize(supra_framework);
+        initialize_for_test_custom(
+            supra_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            1000000
+        );
+    }
+
+    #[test_only]
+    public fun join_validator_set_for_test(
+        pk: &validator_public_keys::ValidatorPublicKeys,
+        operator: &signer,
+        pool_address: address,
+        should_end_epoch: bool
+    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let pk_bytes = validator_public_keys::public_key_to_bytes(*pk);
+        // Test fixture: rotate through the genesis (PoP-exempt) path.
+        rotate_consensus_key_genesis(operator, pool_address, pk_bytes);
+        join_validator_set(operator, pool_address);
+        if (should_end_epoch) {
+            end_epoch();
+        }
+    }
+
+    #[test_only]
+    public fun fast_forward_to_unlock(
+        pool_address: address
+    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let expiration_time = get_lockup_secs(pool_address);
+        timestamp::update_global_time_for_test_secs(expiration_time);
+        end_epoch();
+    }
+
+    // Convenient function for setting up all required stake initializations.
+    #[test_only]
+    public fun initialize_for_test_custom(
+        supra_framework: &signer,
+        minimum_stake: u64,
+        maximum_stake: u64,
+        recurring_lockup_secs: u64,
+        allow_validator_set_change: bool,
+        rewards_rate_numerator: u64,
+        rewards_rate_denominator: u64,
+        voting_power_increase_limit: u64
+    ) {
+        timestamp::set_time_has_started_for_testing(supra_framework);
+        reconfiguration_state::initialize(supra_framework);
+        if (!exists<ValidatorSet>(@supra_framework)) {
+            initialize(supra_framework);
+        };
+        staking_config::initialize_for_test(
+            supra_framework,
+            minimum_stake,
+            maximum_stake,
+            recurring_lockup_secs,
+            allow_validator_set_change,
+            rewards_rate_numerator,
+            rewards_rate_denominator,
+            voting_power_increase_limit
+        );
+
+        if (!exists<SupraCoinCapabilities>(@supra_framework)) {
+            let (burn_cap, mint_cap) = supra_coin::initialize_for_test(supra_framework);
+            store_supra_coin_mint_cap(supra_framework, mint_cap);
+            coin::destroy_burn_cap<SupraCoin>(burn_cap);
+        };
+    }
+
+    // This function assumes the stake module already the capability to mint aptos coins.
+    #[test_only]
+    public fun mint_coins(amount: u64): Coin<SupraCoin> acquires SupraCoinCapabilities {
+        let mint_cap = &borrow_global<SupraCoinCapabilities>(@supra_framework).mint_cap;
+        coin::mint(amount, mint_cap)
+    }
+
+    #[test_only]
+    public fun mint(account: &signer, amount: u64) acquires SupraCoinCapabilities {
+        coin::register<SupraCoin>(account);
+        coin::deposit(signer::address_of(account), mint_coins(amount));
+    }
+
+    #[test_only]
+    public fun mint_and_add_stake(
+        account: &signer, amount: u64
+    ) acquires SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorSet {
+        mint(account, amount);
+        add_stake(account, amount);
+    }
+
+    #[test_only]
+    public fun initialize_test_validator(
+        public_key: &validator_public_keys::ValidatorPublicKeys,
+        validator: &signer,
+        amount: u64,
+        should_join_validator_set: bool,
+        should_end_epoch: bool
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let validator_address = signer::address_of(validator);
+        if (!account::exists_at(signer::address_of(validator))) {
+            account::create_account_for_test(validator_address);
+        };
+
+        let pk_bytes = validator_public_keys::public_key_to_bytes(*public_key);
+        // Test fixtures register through the genesis (PoP-exempt) path; see
+        // `register_test_validator_with_addresses`.
+        initialize_validator_genesis(
+            validator,
+            pk_bytes,
+            vector::empty(),
+            vector::empty()
+        );
+
+        if (amount > 0) {
+            mint_and_add_stake(validator, amount);
+        };
+
+        if (should_join_validator_set) {
+            join_validator_set(validator, validator_address);
+        };
+        if (should_end_epoch) {
+            end_epoch();
+        };
+    }
+
+    #[test_only]
+    public fun create_validator_set(
+        supra_framework: &signer,
+        active_validator_addresses: vector<address>,
+        public_keys: vector<validator_public_keys::ValidatorPublicKeys>
+    ) {
+        let active_validators = vector::empty<ValidatorInfo>();
+        let i = 0;
+        while (i < vector::length(&active_validator_addresses)) {
+            let validator_address = vector::borrow(&active_validator_addresses, i);
+            let pk = vector::borrow(&public_keys, i);
+            vector::push_back(
+                &mut active_validators,
+                ValidatorInfo {
+                    addr: *validator_address,
+                    voting_power: 0,
+                    config: ValidatorConfig {
+                        consensus_pubkey: validator_public_keys::public_key_to_bytes(*pk),
+                        network_addresses: b"",
+                        fullnode_addresses: b"",
+                        validator_index: 0
+                    }
+                }
+            );
+            i = i + 1;
+        };
+
+        move_to(
+            supra_framework,
+            ValidatorSet {
+                consensus_scheme: 0,
+                // active validators for the current epoch
+                active_validators,
+                // pending validators to leave in next epoch (still active)
+                pending_inactive: vector::empty<ValidatorInfo>(),
+                // pending validators to join in next epoch
+                pending_active: vector::empty<ValidatorInfo>(),
+                total_voting_power: 0,
+                total_joining_power: 0
+            }
+        );
+    }
+
+    #[test_only]
+    public fun create_stake_pool(
+        account: &signer,
+        active: Coin<SupraCoin>,
+        pending_inactive: Coin<SupraCoin>,
+        locked_until_secs: u64
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorSet {
+        let account_address = signer::address_of(account);
+        initialize_stake_owner(account, 0, account_address, account_address);
+        let stake_pool = borrow_global_mut<StakePool>(account_address);
+        coin::merge(&mut stake_pool.active, active);
+        coin::merge(&mut stake_pool.pending_inactive, pending_inactive);
+        stake_pool.locked_until_secs = locked_until_secs;
+    }
+
+    // Allows unit tests to set custom validator performances.
+    #[test_only]
+    public fun update_validator_performances_for_test(
+        proposer_index: Option<u64>, failed_proposer_indices: vector<u64>
+    ) acquires ValidatorPerformance {
+        update_performance_statistics(proposer_index, failed_proposer_indices);
+    }
+
+    #[test_only]
+    public fun generate_identity(): (
+        validator_public_keys::ValidatorSecretKeys,
+        validator_public_keys::ValidatorPublicKeys
+    ) {
+        validator_public_keys::generate_keys()
+    }
+
+    /// Returns the serialized bytes of a freshly generated, unique consensus public key with a
+    /// valid BLS multisig proof-of-possession appended, i.e. exactly what an operator submits to
+    /// `rotate_consensus_key` under the v2 identity format (which is enabled in the test VM).
+    #[test_only]
+    public fun generate_unique_consensus_pubkey_bytes(): vector<u8> {
+        let (sk, pk) = generate_identity();
+        validator_public_keys::serialized_keys_with_pop_for_test(&sk, &pk)
+    }
+
+    #[test_only]
+    fun register_test_validator_with_addresses(
+        public_key: &validator_public_keys::ValidatorPublicKeys,
+        validator: &signer,
+        network_addresses: vector<u8>,
+        fullnode_addresses: vector<u8>
+    ) acquires AllowedValidators, ValidatorConfig, ValidatorSet {
+        let validator_address = signer::address_of(validator);
+        if (!account::exists_at(validator_address)) {
+            account::create_account_for_test(validator_address);
+        };
+        let pk_bytes = validator_public_keys::public_key_to_bytes(*public_key);
+        // Test fixtures register through the genesis (PoP-exempt) path: they are trusted setup and
+        // do not carry an operator proof-of-possession. PoP enforcement is covered by the dedicated
+        // `initialize_validator` / `rotate_consensus_key` tests.
+        initialize_validator_genesis(
+            validator,
+            pk_bytes,
+            network_addresses,
+            fullnode_addresses
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10016, location = Self)]
+    public entry fun test_initialize_validator_rejects_duplicate_consensus_pubkey_active(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        // validator_1 joins and becomes active in the next epoch.
+        initialize_test_validator(&pk, validator_1, 100, true, true);
+        // validator_2 tries to register with the same consensus key - should abort.
+        initialize_test_validator(&pk, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10016, location = Self)]
+    public entry fun test_initialize_validator_rejects_duplicate_consensus_pubkey_pending_active(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        // validator_1 joins pending_active but no epoch transition.
+        initialize_test_validator(&pk, validator_1, 100, true, false);
+        // validator_2 tries to register with the same key against pending_active - should abort.
+        initialize_test_validator(&pk, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    /// The network key must identify exactly one validator: the transport layer derives a peer's
+    /// identity from that key alone. Here the two validators differ in every other static key.
+    public entry fun test_initialize_validator_rejects_shared_network_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        validator_public_keys::copy_network_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    public entry fun test_initialize_validator_rejects_shared_bls_multisig_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        validator_public_keys::copy_bls_multisig_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    public entry fun test_initialize_validator_rejects_shared_class_group_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        validator_public_keys::copy_class_group_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    public entry fun test_initialize_validator_rejects_shared_ed25519_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        validator_public_keys::copy_ed25519_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    /// The check covers `pending_active` as well as the active set, so a shared key cannot be slipped
+    /// in during the window between joining and the epoch transition.
+    public entry fun test_initialize_validator_rejects_shared_network_key_pending_active(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        validator_public_keys::copy_network_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    /// Rotation is the second path on which a validator supplies static keys, so it carries the same
+    /// uniqueness requirement as registration. It is also the path where the submitted blob and the
+    /// stored blob differ: the merge preserves the caller's own DKG threshold keys. The static keys
+    /// are the same in both, which is what makes comparing them the right check here.
+    public entry fun test_rotate_consensus_key_rejects_shared_class_group_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        // Only the class-group key is taken from validator_1, so validator_2's own BLS multisig key
+        // is unchanged and its proof-of-possession still verifies.
+        validator_public_keys::copy_class_group_key_for_test(&mut pk_2, &pk_1);
+        let rotated_bytes =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_2, &pk_2);
+        rotate_consensus_key(validator_2, signer::address_of(validator_2), rotated_bytes);
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    #[expected_failure(abort_code = 0x1001B, location = Self)]
+    /// Uniqueness is a property of the next validator set, so a stored key is checked again against
+    /// that set whenever it re-enters it. Registration ranges over the same set, which is what makes
+    /// the intermediate registration here a legitimate one.
+    public entry fun test_join_validator_set_rejects_shared_static_key(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        // validator_3 keeps the set non-empty so that validator_1 is allowed to leave it.
+        initialize_test_validator(&pk_3, validator_3, 100, true, false);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        // Ending the epoch after the departure takes validator_1 all the way to INACTIVE, so it is
+        // in neither list registration scans.
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+        end_epoch();
+        // validator_2 registers with validator_1's network key. Registration ranges over the next
+        // validator set only, so it has nothing to compare against and succeeds.
+        validator_public_keys::copy_network_key_for_test(&mut pk_2, &pk_1);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        // validator_1 rejoins with the key it stored before leaving - should abort.
+        join_validator_set(validator_1, signer::address_of(validator_1));
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    #[expected_failure(abort_code = 0x10016, location = Self)]
+    /// The join-time check covers the whole-blob rule as well as the per-static-key one.
+    public entry fun test_join_validator_set_rejects_duplicate_consensus_pubkey(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        initialize_test_validator(&pk_3, validator_3, 100, true, false);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+        end_epoch();
+        initialize_test_validator(&pk_1, validator_2, 100, true, true);
+        join_validator_set(validator_1, signer::address_of(validator_1));
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234
+        )
+    ]
+    /// A validator whose stored key is still its own alone rejoins as before: the check excludes the
+    /// joiner itself, and `pending_inactive` - where a validator that left in the current epoch
+    /// still holds its own key - is outside the next validator set.
+    public entry fun test_join_validator_set_allows_rejoin_with_unique_key(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let validator_1_address = signer::address_of(validator_1);
+        initialize_test_validator(&pk_2, validator_2, 100, true, false);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        leave_validator_set(validator_1, validator_1_address);
+        end_epoch();
+        assert!(
+            get_validator_state(validator_1_address) == VALIDATOR_STATUS_INACTIVE, 0
+        );
+        join_validator_set(validator_1, validator_1_address);
+        end_epoch();
+        assert!(get_validator_state(validator_1_address) == VALIDATOR_STATUS_ACTIVE, 1);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10017, location = Self)]
+    public entry fun test_initialize_validator_rejects_duplicate_network_addresses(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let validator_1_address = signer::address_of(validator_1);
+        register_test_validator_with_addresses(&pk_1, validator_1, b"net-1", b"fn-1");
+        mint_and_add_stake(validator_1, 100);
+        join_validator_set(validator_1, validator_1_address);
+        // validator_2 tries to reuse the same network address - should abort.
+        register_test_validator_with_addresses(&pk_2, validator_2, b"net-1", b"fn-2");
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_initialize_validator_allows_unique_credentials(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let validator_1_address = signer::address_of(validator_1);
+        register_test_validator_with_addresses(&pk_1, validator_1, b"net-1", b"fn-1");
+        mint_and_add_stake(validator_1, 100);
+        join_validator_set(validator_1, validator_1_address);
+        // Distinct key and address - should succeed.
+        register_test_validator_with_addresses(&pk_2, validator_2, b"net-2", b"fn-2");
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_initialize_validator_allows_two_empty_network_addresses(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        // Both validators register with empty network_addresses via initialize_test_validator.
+        // The empty-skip rule lets this succeed; existing test helpers must keep working.
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10016, location = Self)]
+    public entry fun test_rotate_consensus_key_rejects_duplicate(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let pk_1_bytes =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_1, &pk_1);
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        // validator_2 tries to rotate to validator_1's consensus key - should abort.
+        rotate_consensus_key(validator_2, signer::address_of(validator_2), pk_1_bytes);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_rotate_consensus_key_allows_fresh_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        let (sk_new, pk_new) = generate_identity();
+        let pk_new_bytes =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new);
+        rotate_consensus_key(validator, signer::address_of(validator), pk_new_bytes);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_rotate_consensus_key_allows_self_rotation(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (sk, pk) = generate_identity();
+        let pk_bytes = validator_public_keys::serialized_keys_with_pop_for_test(
+            &sk, &pk
+        );
+        initialize_test_validator(&pk, validator, 100, true, true);
+        // Rotating to the same key the validator already holds is a no-op and must not abort.
+        rotate_consensus_key(validator, signer::address_of(validator), pk_bytes);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// An operator rotation must preserve the DKG-managed BLS threshold keys (written by
+    /// `set_dkg_output_keys`) and only swap the static keys. This holds under the v2 identity format.
+    public entry fun test_rotate_consensus_key_preserves_threshold_keys(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // v2 is enabled by default in the test VM; this makes the dependency explicit.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+
+        // Seed a DKG-style threshold key on the validator's initial keys. The fixture registers via
+        // the genesis (PoP-exempt) helper, so the seeded keys are stored as-is. Reuse the multisig
+        // key as a stand-in `bls12381::PublicKey` so the test needs no extra crypto imports.
+        let (_sk, pk) = generate_identity();
+        let threshold_key = validator_public_keys::get_supra_bls_multi_sig_pub_key(&pk);
+        validator_public_keys::rotate_supra_bls_threshold_validity_key(
+            &mut pk, threshold_key
+        );
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Rotate to a fresh static identity whose threshold fields are empty (modelling an operator
+        // rotating from a node that has not yet received the latest DKG keys). The operator submits
+        // the keys with an appended BLS multisig proof-of-possession.
+        let (sk_new, pk_new) = generate_identity();
+        let pk_new_bytes =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new);
+        rotate_consensus_key(validator, signer::address_of(validator), pk_new_bytes);
+
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        let stored =
+            validator_public_keys::validator_public_keys_from_bytes(stored_bytes);
+
+        // The DKG threshold key survived the operator rotation (0 = validity certificate type).
+        let preserved =
+            validator_public_keys::get_supra_bls_threshold_key_by_type(&stored, 0);
+        assert!(option::is_some(&preserved), 3001);
+        assert!(option::extract(&mut preserved) == threshold_key, 3002);
+
+        // The static keys were actually rotated to `pk_new`'s.
+        assert!(
+            validator_public_keys::get_supra_ed_key(&stored)
+                == validator_public_keys::get_supra_ed_key(&pk_new),
+            3003
+        );
+        assert!(
+            validator_public_keys::get_network_key(&stored)
+                == validator_public_keys::get_network_key(&pk_new),
+            3004
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000b, location = Self)]
+    /// Registration must reject a consensus public key blob that deserializes but carries a
+    /// malformed static key (here, an empty network key), even when its appended BLS multisig PoP
+    /// is valid. Validated under the v2 identity format.
+    public entry fun test_initialize_validator_rejects_invalid_consensus_pubkey(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let invalid_pubkey =
+            validator_public_keys::serialized_keys_with_invalid_network_key_and_pop_for_test();
+        initialize_validator(validator, invalid_pubkey, b"net", b"fn");
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10018, location = Self)]
+    /// Under v2, an operator key submission whose appended BLS multisig PoP does not verify must be
+    /// rejected with `EINVALID_PROOF_OF_POSSESSION` (24 = 0x18).
+    public entry fun test_initialize_validator_rejects_invalid_pop(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        // Well-formed keys, but the appended PoP is generated from a different (freshly generated)
+        // secret, so it does not match pk's multisig key.
+        let (_sk, pk) = generate_identity();
+        let (other_sk, _other_pk) = generate_identity();
+        let blob =
+            validator_public_keys::serialized_keys_with_pop_for_test(&other_sk, &pk);
+        initialize_validator(validator, blob, b"net", b"fn");
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_keep = @0x123,
+            validator_eject = @0x234
+        )
+    ]
+    /// Full recovery lifecycle for a validator that never rotated to a v2 consensus key before the
+    /// v2 identity format was enforced. Once v2 is enforced, such a validator (still a legacy bare
+    /// ed25519 key) is ejected from the active set at the next epoch transition, while a rotated
+    /// (v2) validator is retained with a contiguous validator_index -- the invariant that lets DKG /
+    /// `set_dkg_output_keys` assume every active validator has a valid v2 key, and what prevents the
+    /// DKG-committee resolution failure on unrotated validators. The ejected validator can then
+    /// migrate: `rotate_consensus_key` accepts a v2 key over the stored legacy key (rather than
+    /// aborting while trying to merge DKG threshold keys into it), after which the validator can
+    /// rejoin the active set.
+    public entry fun test_legacy_validator_ejected_then_migrates_and_rejoins(
+        supra_framework: &signer, validator_keep: &signer, validator_eject: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // Model the pre-upgrade state: disable the v2 identity format, and `SUPRA_DKG`, which
+        // requires it, so a legacy (bare ed25519) consensus key can still be registered (the test
+        // VM enables both by default).
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let keep_addr = signer::address_of(validator_keep);
+        let eject_addr = signer::address_of(validator_eject);
+
+        // `validator_keep` registers with a v2 consensus key and joins the active set.
+        let (_keep_sk, keep_pk) = generate_identity();
+        initialize_test_validator(&keep_pk, validator_keep, 100, true, false);
+
+        // `validator_eject` registers with a legacy (bare ed25519) consensus key while v2 is still
+        // disabled, then joins. This models a validator that never rotated across the upgrade.
+        let (_eject_sk, eject_vpk) = ed25519::generate_keys();
+        let legacy_key_bytes = ed25519::validated_public_key_to_bytes(&eject_vpk);
+        account::create_account_for_test(eject_addr);
+        initialize_validator_genesis(
+            validator_eject,
+            legacy_key_bytes,
+            vector::empty(),
+            vector::empty()
+        );
+        mint_and_add_stake(validator_eject, 100);
+        join_validator_set(validator_eject, eject_addr);
+
+        // Both validators activate while v2 is disabled.
+        end_epoch();
+        assert!(get_validator_state(keep_addr) == VALIDATOR_STATUS_ACTIVE, 0);
+        assert!(get_validator_state(eject_addr) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // Enforce the v2 identity format.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+
+        // The next epoch transition ejects the unrotated (legacy-key) validator and keeps the v2 one.
+        end_epoch();
+        assert!(get_validator_state(keep_addr) == VALIDATOR_STATUS_ACTIVE, 2);
+        assert!(get_validator_state(eject_addr) == VALIDATOR_STATUS_INACTIVE, 3);
+        // The surviving validator keeps a contiguous validator_index.
+        assert!(borrow_global<ValidatorConfig>(keep_addr).validator_index == 0, 4);
+
+        // Migrate: the ejected validator rotates its stored legacy ed25519 key to a v2 consensus
+        // key. Before the fix this aborted -- `rotate_consensus_key_internal` tried to parse the
+        // stored legacy key as a `ValidatorPublicKeys` blob to merge DKG threshold keys into it. The
+        // `is_unrotated_legacy_key` guard skips that merge and stores the incoming v2 blob verbatim.
+        // The submission carries an appended BLS multisig PoP, exactly as an operator would submit.
+        rotate_consensus_key(
+            validator_eject, eject_addr, generate_unique_consensus_pubkey_bytes()
+        );
+
+        // The stored key is now a valid v2 key: no longer an unrotated legacy key, and it
+        // deserializes as a canonical `ValidatorPublicKeys` (this call aborts if it does not).
+        let (migrated_bytes, _net, _fn) = get_validator_config(eject_addr);
+        assert!(!is_unrotated_legacy_key(&migrated_bytes), 5);
+        validator_public_keys::validator_public_keys_from_bytes(migrated_bytes);
+
+        // Rejoin: the ejected validator is INACTIVE but still holds its stake, so it can re-join.
+        // Eligibility is re-checked at the next epoch, where the migrated v2 key now passes.
+        join_validator_set(validator_eject, eject_addr);
+        end_epoch();
+        assert!(get_validator_state(eject_addr) == VALIDATOR_STATUS_ACTIVE, 6);
+        assert!(get_validator_state(keep_addr) == VALIDATOR_STATUS_ACTIVE, 7);
+        // Both validators occupy contiguous indices in the reconstituted active set: the retained
+        // validator keeps index 0 and the rejoining one is appended at index 1.
+        assert!(borrow_global<ValidatorConfig>(keep_addr).validator_index == 0, 8);
+        assert!(borrow_global<ValidatorConfig>(eject_addr).validator_index == 1, 9);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x3001a, location = Self)]
+    /// Under the v2 identity format, a validator whose stored consensus key is still a legacy bare
+    /// ed25519 key is rejected at `join_validator_set` with an actionable error, instead of joining
+    /// successfully and then being silently dropped by the eligibility filter at every epoch
+    /// boundary.
+    public entry fun test_join_validator_set_rejects_unrotated_legacy_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        // Register with a legacy (bare ed25519) consensus key while the v2 identity format and
+        // `SUPRA_DKG` are disabled, modeling a validator grandfathered in from before the format
+        // change.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let validator_address = signer::address_of(validator);
+        let (_sk, legacy_vpk) = ed25519::generate_keys();
+        account::create_account_for_test(validator_address);
+        initialize_validator_genesis(
+            validator,
+            ed25519::validated_public_key_to_bytes(&legacy_vpk),
+            vector::empty(),
+            vector::empty()
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Enforce the v2 identity format; the un-migrated key must now be rejected at join time.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        join_validator_set(validator, validator_address);
+    }
+
+    #[test_only]
+    /// Disables the v2 identity format and `SUPRA_DKG`, then registers `validator` with a legacy
+    /// (bare ed25519) consensus key and 100 stake. Returns the stored key bytes.
+    fun register_legacy_key_validator_for_test(
+        supra_framework: &signer, validator: &signer
+    ): vector<u8> acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let validator_address = signer::address_of(validator);
+        let (_sk, legacy_vpk) = ed25519::generate_keys();
+        let legacy_key_bytes = ed25519::validated_public_key_to_bytes(&legacy_vpk);
+        account::create_account_for_test(validator_address);
+        initialize_validator_genesis(
+            validator,
+            legacy_key_bytes,
+            vector::empty(),
+            vector::empty()
+        );
+        mint_and_add_stake(validator, 100);
+        legacy_key_bytes
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// With both `SUPRA_BLS_KEYS` and `SUPRA_DKG` disabled, a legacy (bare ed25519) consensus key
+    /// is an eligible key: the validator joins and is retained across epoch transitions.
+    public entry fun test_legacy_key_is_eligible_while_dkg_and_validator_identity_v2_disabled(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let legacy_key_bytes = register_legacy_key_validator_for_test(supra_framework, validator);
+        let validator_address = signer::address_of(validator);
+
+        assert!(!is_unrotated_legacy_key(&legacy_key_bytes), 0);
+        assert!(is_eligible_active_validator(100, 100, &legacy_key_bytes), 1);
+
+        join_validator_set(validator, validator_address);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 3);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_keep = @0x123, validator_legacy = @0x234)]
+    /// While `SUPRA_DKG` is enabled, a validator whose consensus key is a legacy bare ed25519 key is
+    /// excluded from the next validator set, whether or not `SUPRA_BLS_KEYS` is enabled. A validator
+    /// with a v2 key is retained with a contiguous validator_index.
+    public entry fun test_unrotated_legacy_key_is_ineligible_while_dkg_enabled(
+        supra_framework: &signer, validator_keep: &signer, validator_legacy: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let legacy_key_bytes =
+            register_legacy_key_validator_for_test(supra_framework, validator_legacy);
+        let keep_addr = signer::address_of(validator_keep);
+        let legacy_addr = signer::address_of(validator_legacy);
+        join_validator_set(validator_legacy, legacy_addr);
+        let (_keep_sk, keep_pk) = generate_identity();
+        initialize_test_validator(&keep_pk, validator_keep, 100, true, false);
+        end_epoch();
+        assert!(get_validator_state(keep_addr) == VALIDATOR_STATUS_ACTIVE, 0);
+        assert!(get_validator_state(legacy_addr) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // `SUPRA_DKG` on and `SUPRA_BLS_KEYS` off. The feature-change functions reject this set,
+        // so it is written directly.
+        features::change_feature_flags_unchecked_for_testing(
+            supra_framework,
+            vector[features::get_supra_dkg_feature()],
+            vector[]
+        );
+        assert!(!features::supra_validator_identity_v2_enabled(), 2);
+        assert!(is_unrotated_legacy_key(&legacy_key_bytes), 3);
+        assert!(!is_eligible_active_validator(100, 100, &legacy_key_bytes), 4);
+
+        end_epoch();
+        assert!(get_validator_state(keep_addr) == VALIDATOR_STATUS_ACTIVE, 5);
+        assert!(get_validator_state(legacy_addr) == VALIDATOR_STATUS_INACTIVE, 6);
+        assert!(borrow_global<ValidatorConfig>(keep_addr).validator_index == 0, 7);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x3001a, location = Self)]
+    /// While `SUPRA_DKG` is enabled, `join_validator_set` rejects a validator whose stored consensus
+    /// key is a legacy bare ed25519 key, whether or not `SUPRA_BLS_KEYS` is enabled.
+    public entry fun test_join_validator_set_rejects_unrotated_legacy_key_while_dkg_enabled(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        register_legacy_key_validator_for_test(supra_framework, validator);
+        features::change_feature_flags_unchecked_for_testing(
+            supra_framework,
+            vector[features::get_supra_dkg_feature()],
+            vector[]
+        );
+        join_validator_set(validator, signer::address_of(validator));
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Under v2, a correctly pop-appended operator submission succeeds and the stored key is the
+    /// canonical `ValidatorPublicKeys` with the PoP stripped (parses with no trailing bytes).
+    public entry fun test_rotate_consensus_key_accepts_valid_pop_and_strips_it(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+
+        let (sk_new, pk_new) = generate_identity();
+        let blob =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new);
+        rotate_consensus_key(validator, signer::address_of(validator), blob);
+
+        // The stored key is the canonical (PoP-stripped) ValidatorPublicKeys for pk_new.
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        let stored =
+            validator_public_keys::validator_public_keys_from_bytes(stored_bytes);
+        assert!(
+            validator_public_keys::get_supra_ed_key(&stored)
+                == validator_public_keys::get_supra_ed_key(&pk_new),
+            6001
+        );
+        assert!(
+            stored_bytes == validator_public_keys::public_key_to_bytes(pk_new),
+            6002
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Genesis registration is PoP-exempt: under v2, `initialize_validator_genesis` accepts a blob
+    /// with no appended PoP and stores it verbatim.
+    public entry fun test_initialize_validator_genesis_skips_pop(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        let pk_bytes = validator_public_keys::public_key_to_bytes(pk);
+        let validator_address = signer::address_of(validator);
+        if (!account::exists_at(validator_address)) {
+            account::create_account_for_test(validator_address);
+        };
+        initialize_validator_genesis(validator, pk_bytes, b"net", b"fn");
+        let (stored_bytes, _net, _fn) = get_validator_config(validator_address);
+        assert!(stored_bytes == pk_bytes, 7001);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Pre-v2 migration fallback: an operator new-format submission must still carry a valid BLS
+    /// multisig PoP, which the contract verifies and strips, storing the canonical key. PoP
+    /// enforcement is tied to the key format, not the v2 flag.
+    public entry fun test_rotate_consensus_key_fallback_verifies_pop(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Disable v2, and `SUPRA_DKG`, which requires it, to exercise the pre-v2 migration fallback.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+
+        let (sk_new, pk_new) = generate_identity();
+        let blob =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new);
+        rotate_consensus_key(validator, signer::address_of(validator), blob);
+
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        assert!(stored_bytes == validator_public_keys::public_key_to_bytes(pk_new), 8001);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10018, location = Self)]
+    /// Pre-v2 migration fallback: a new-format submission with a non-matching PoP is rejected with
+    /// `EINVALID_PROOF_OF_POSSESSION` (24 = 0x18), exactly as under v2.
+    public entry fun test_rotate_consensus_key_fallback_rejects_invalid_pop(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        // PoP generated from a different secret, so it does not match pk_new's multisig key.
+        let (_sk_new, pk_new) = generate_identity();
+        let (other_sk, _other_pk) = generate_identity();
+        let blob =
+            validator_public_keys::serialized_keys_with_pop_for_test(&other_sk, &pk_new);
+        rotate_consensus_key(validator, signer::address_of(validator), blob);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Pre-v2 migration fallback: a bare 32-byte ed25519 consensus key (legacy format) has no
+    /// aggregatable BLS key, so it is accepted without a PoP and stored unchanged.
+    public entry fun test_rotate_consensus_key_fallback_accepts_legacy_ed25519(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let (_legacy_sk, legacy_pk) = ed25519::generate_keys();
+        let legacy_bytes = ed25519::validated_public_key_to_bytes(&legacy_pk);
+        rotate_consensus_key(validator, signer::address_of(validator), legacy_bytes);
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        assert!(stored_bytes == legacy_bytes, 8101);
+    }
+
+    #[test_only]
+    /// Returns an otherwise well-formed operator submission (valid static keys, valid appended BLS
+    /// multisig proof-of-possession) whose validity-certificate BLS threshold field is populated.
+    /// That field belongs to the DKG, so no legitimate submission carries it.
+    fun consensus_pubkey_bytes_with_threshold_key(): vector<u8> {
+        let (sk, pk) = generate_identity();
+        // Any well-formed `bls12381::PublicKey` will do; reuse the multisig key so the helper needs
+        // no extra key generation. The check rejects the field's presence, not its value.
+        let threshold_key = validator_public_keys::get_supra_bls_multi_sig_pub_key(&pk);
+        validator_public_keys::rotate_supra_bls_threshold_validity_key(
+            &mut pk, threshold_key
+        );
+        validator_public_keys::serialized_keys_with_pop_for_test(&sk, &pk)
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10019, location = Self)]
+    /// `initialize_validator` stores the submitted blob as the validator's consensus key with no
+    /// merge, so a submitted DKG-managed BLS threshold key share would become the validator's own.
+    /// It must be rejected.
+    public entry fun test_initialize_validator_rejects_bls_threshold_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, ValidatorSet, ValidatorConfig {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        initialize_validator(
+            validator,
+            consensus_pubkey_bytes_with_threshold_key(),
+            b"net",
+            b"fn"
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10019, location = Self)]
+    /// A pool created via `initialize_stake_owner` has an empty stored consensus key, so its first
+    /// `rotate_consensus_key` has nothing to merge into and stores the submitted blob verbatim. A
+    /// DKG-managed BLS threshold key share must be rejected there too.
+    ///
+    /// The identity-v2 format is enabled here, so this pins the case shut in the configuration where
+    /// every other rotation takes the static-key merge: enabling the feature does not close this
+    /// registration path, because it turns on nothing that this path passes through.
+    public entry fun test_rotate_consensus_key_over_empty_key_rejects_bls_threshold_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        rotate_consensus_key(
+            validator,
+            validator_address,
+            consensus_pubkey_bytes_with_threshold_key()
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10019, location = Self)]
+    /// The same registration path with the identity-v2 format still disabled, where every rotation
+    /// takes the non-merge branch. Rejection must not depend on the feature being on.
+    public entry fun test_rotate_consensus_key_over_empty_key_rejects_bls_threshold_key_pre_v2(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        rotate_consensus_key(
+            validator,
+            validator_address,
+            consensus_pubkey_bytes_with_threshold_key()
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10019, location = Self)]
+    /// The legacy -> v2 migration rotation also stores the submitted blob verbatim: the stored
+    /// legacy ed25519 key cannot be parsed as a `ValidatorPublicKeys` and holds no threshold keys to
+    /// preserve. This is the rotation every validator registered before the v2 identity format
+    /// performs, so a DKG-managed BLS threshold key share must be rejected here as well.
+    public entry fun test_legacy_migration_rotate_rejects_bls_threshold_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        // Model the pre-upgrade state (v2 identity format and `SUPRA_DKG` disabled) so a legacy
+        // (bare ed25519) consensus key can be registered.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_supra_validator_identity_v2_feature(),
+                features::get_supra_dkg_feature()
+            ]
+        );
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        let (_legacy_sk, legacy_pk) = ed25519::generate_keys();
+        initialize_validator_genesis(
+            validator,
+            ed25519::validated_public_key_to_bytes(&legacy_pk),
+            vector::empty(),
+            vector::empty()
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Enforce the v2 identity format, then migrate the stored legacy key.
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        rotate_consensus_key(
+            validator,
+            validator_address,
+            consensus_pubkey_bytes_with_threshold_key()
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Ending an epoch preserves the outgoing epoch's validator set, and the archive is a copy: a
+    /// later key rotation writes `ValidatorConfig` without disturbing it.
+    ///
+    /// This is what lets a completed DKG session refer to the validators that dealt it by address
+    /// alone, instead of copying their keys into the session.
+    public entry fun test_on_new_epoch_archives_the_outgoing_validator_set(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Whatever is live now is what must be preserved when this epoch ends.
+        let outgoing = *borrow_global<ValidatorSet>(@supra_framework);
+        end_epoch();
+
+        assert!(exists<PreviousValidatorSet>(@supra_framework), 9401);
+        let archived = borrow_global<PreviousValidatorSet>(@supra_framework).validator_set;
+        assert!(archived == outgoing, 9402);
+
+        // A rotation afterwards must not reach into the archive, or a session that referred back to
+        // this epoch would resolve its members to keys they never dealt with.
+        let (sk_new, pk_new) = generate_identity();
+        rotate_consensus_key(
+            validator,
+            signer::address_of(validator),
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new)
+        );
+        assert!(
+            borrow_global<PreviousValidatorSet>(@supra_framework).validator_set == archived,
+            9403
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// The DKG remains free to populate a validator's BLS threshold key shares, and what it writes
+    /// is what ends up stored.
+    public entry fun test_set_dkg_output_keys_populates_threshold_key(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Stand in for the DKG output for the validity certificate type (threshold type 0). The DKG
+        // writes its output mid-reconfiguration, which is also when the next validator set (the
+        // committee the output is indexed by) is well defined.
+        let (_dkg_sk, dkg_pop_pk) = bls12381::generate_keys();
+        let dkg_key = bls12381::public_key_with_pop_to_normal(&dkg_pop_pk);
+        reconfiguration_state::on_reconfig_start();
+        set_dkg_output_keys(
+            vector[
+                dkg_committee::new_dkg_committee_output(
+                    0, vector[bls12381::public_key_to_bytes(&dkg_key)]
+                )]
+        );
+        reconfiguration_state::on_reconfig_finish();
+
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        let stored =
+            validator_public_keys::validator_public_keys_from_bytes(stored_bytes);
+        let written =
+            validator_public_keys::get_supra_bls_threshold_key_by_type(&stored, 0);
+        assert!(option::is_some(&written), 9001);
+        assert!(option::extract(&mut written) == dkg_key, 9002);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// Installing the DKG output against the membership the session pinned needs neither the next
+    /// validator set nor an in-progress reconfiguration: the ordering is supplied by the caller, so
+    /// there is nothing left here to disagree with it.
+    public entry fun test_set_dkg_output_keys_for_members_uses_the_given_addresses(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        let validator_address = signer::address_of(validator);
+
+        let (_dkg_sk, dkg_pop_pk) = bls12381::generate_keys();
+        let dkg_key = bls12381::public_key_with_pop_to_normal(&dkg_pop_pk);
+        set_dkg_output_keys_for_members(
+            vector[validator_address],
+            vector[
+                dkg_committee::new_dkg_committee_output(
+                    0, vector[bls12381::public_key_to_bytes(&dkg_key)]
+                )]
+        );
+
+        let (stored_bytes, _net, _fn) = get_validator_config(validator_address);
+        let stored =
+            validator_public_keys::validator_public_keys_from_bytes(stored_bytes);
+        let written =
+            validator_public_keys::get_supra_bls_threshold_key_by_type(&stored, 0);
+        assert!(option::is_some(&written), 9201);
+        assert!(option::extract(&mut written) == dkg_key, 9202);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10015, location = Self)]
+    /// An output carrying a different number of key shares than the session pinned members is
+    /// rejected rather than installed against a shifted ordering.
+    public entry fun test_set_dkg_output_keys_for_members_rejects_a_key_count_mismatch(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        let (_dkg_sk, dkg_pop_pk) = bls12381::generate_keys();
+        let dkg_key = bls12381::public_key_with_pop_to_normal(&dkg_pop_pk);
+        // Two members, one key share.
+        set_dkg_output_keys_for_members(
+            vector[signer::address_of(validator), @0x456],
+            vector[
+                dkg_committee::new_dkg_committee_output(
+                    0, vector[bls12381::public_key_to_bytes(&dkg_key)]
+                )]
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1001c, location = Self)]
+    /// An output naming a threshold type that no key can be installed for is rejected before any
+    /// validator's key is written.
+    public entry fun test_set_dkg_output_keys_for_members_rejects_uninstallable_threshold_type(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        let (_dkg_sk, dkg_pop_pk) = bls12381::generate_keys();
+        let dkg_key = bls12381::public_key_with_pop_to_normal(&dkg_pop_pk);
+        set_dkg_output_keys_for_members(
+            vector[signer::address_of(validator)],
+            vector[
+                dkg_committee::new_dkg_committee_output(
+                    7, vector[bls12381::public_key_to_bytes(&dkg_key)]
+                )]
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// An operator rotating an already-migrated v2 key submits its node's current view of its own
+    /// keys, which still includes the shares the DKG issued for the current epoch. That submission
+    /// takes the static-key merge, which discards the submitted threshold material, so it is
+    /// accepted and the stored shares remain the ones the DKG wrote.
+    ///
+    /// Runs with the identity-v2 format enabled and after a DKG write, i.e. the configuration in
+    /// which routine operator key rotation happens. The submission populates a threshold type the
+    /// DKG wrote and one it did not, so the assertions cover both halves of the merge: the DKG's
+    /// share survives, and the type the DKG left alone stays empty rather than picking up the
+    /// submitted value.
+    public entry fun test_rotate_consensus_key_discards_submitted_threshold_keys(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_supra_validator_identity_v2_feature()],
+            vector[]
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        let (_dkg_sk, dkg_pop_pk) = bls12381::generate_keys();
+        let dkg_key = bls12381::public_key_with_pop_to_normal(&dkg_pop_pk);
+        reconfiguration_state::on_reconfig_start();
+        set_dkg_output_keys(
+            vector[
+                dkg_committee::new_dkg_committee_output(
+                    0, vector[bls12381::public_key_to_bytes(&dkg_key)]
+                )]
+        );
+        reconfiguration_state::on_reconfig_finish();
+
+        // The operator's payload carries a share for the threshold type the DKG just wrote, and one
+        // for a type it did not (quorum, threshold type 1).
+        let (sk_new, pk_new) = generate_identity();
+        let submitted_key =
+            validator_public_keys::get_supra_bls_multi_sig_pub_key(&pk_new);
+        validator_public_keys::rotate_supra_bls_threshold_validity_key(
+            &mut pk_new, submitted_key
+        );
+        validator_public_keys::rotate_supra_bls_threshold_quorum_key(
+            &mut pk_new, submitted_key
+        );
+        rotate_consensus_key(
+            validator,
+            signer::address_of(validator),
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new)
+        );
+
+        let (stored_bytes, _net, _fn) =
+            get_validator_config(signer::address_of(validator));
+        let stored =
+            validator_public_keys::validator_public_keys_from_bytes(stored_bytes);
+        let preserved =
+            validator_public_keys::get_supra_bls_threshold_key_by_type(&stored, 0);
+        assert!(option::is_some(&preserved), 9101);
+        let preserved_key = option::extract(&mut preserved);
+        assert!(preserved_key == dkg_key, 9102);
+        assert!(preserved_key != submitted_key, 9103);
+        // The threshold type the DKG did not write stayed empty: the merge discards every threshold
+        // field of the submission, not only those the DKG happens to overwrite.
+        let untouched =
+            validator_public_keys::get_supra_bls_threshold_key_by_type(&stored, 1);
+        assert!(option::is_none(&untouched), 9104);
+        // The static keys were rotated.
+        assert!(
+            validator_public_keys::get_supra_ed_key(&stored)
+                == validator_public_keys::get_supra_ed_key(&pk_new),
+            9105
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10017, location = Self)]
+    public entry fun test_update_network_addresses_rejects_duplicate(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let validator_1_address = signer::address_of(validator_1);
+        register_test_validator_with_addresses(&pk_1, validator_1, b"net-1", b"fn-1");
+        mint_and_add_stake(validator_1, 100);
+        join_validator_set(validator_1, validator_1_address);
+        // validator_2 registers with empty addresses then tries to claim validator_1's net address.
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        update_network_and_fullnode_addresses(
+            validator_2,
+            signer::address_of(validator_2),
+            b"net-1",
+            b"fn-2"
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_update_network_addresses_allows_clear_to_empty(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+        register_test_validator_with_addresses(&pk_1, validator_1, b"net-1", b"fn-1");
+        mint_and_add_stake(validator_1, 100);
+        join_validator_set(validator_1, validator_1_address);
+        register_test_validator_with_addresses(&pk_2, validator_2, b"net-2", b"fn-2");
+        mint_and_add_stake(validator_2, 100);
+        join_validator_set(validator_2, validator_2_address);
+        // Clearing to empty is always allowed (empty == "unset / non-functional").
+        update_network_and_fullnode_addresses(
+            validator_2,
+            validator_2_address,
+            vector::empty(),
+            vector::empty()
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_update_network_addresses_allows_self(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        let validator_address = signer::address_of(validator);
+        register_test_validator_with_addresses(&pk, validator, b"net-self", b"fn-self");
+        mint_and_add_stake(validator, 100);
+        join_validator_set(validator, validator_address);
+        // Re-setting the same address on self must be a no-op, not an abort.
+        update_network_and_fullnode_addresses(
+            validator,
+            validator_address,
+            b"net-self",
+            b"fn-self"
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_inactive_validator_can_add_stake_if_exceeding_max_allowed(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, false, false);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(supra_framework = @0x1, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_pending_active_validator_cannot_add_stake_if_exceeding_max_allowed(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100000
+        );
+        // Have one validator join the set to ensure the validator set is not empty when main validator joins.
+        let (_sk_1, pk_1) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+
+        // Validator 2 joins validator set but epoch has not ended so validator is in pending_active state.
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_2, validator_2, 100, true, false);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator_2, 9901);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_active_validator_cannot_add_stake_if_exceeding_max_allowed(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // Validator joins validator set and waits for epoch end so it's in the validator set.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_active_validator_with_pending_inactive_stake_cannot_add_stake_if_exceeding_max_allowed(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // Validator joins validator set and waits for epoch end so it's in the validator set.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Request to unlock 50 coins, which go to pending_inactive. Validator has 50 remaining in active.
+        unlock(validator, 50);
+        assert_validator_state(signer::address_of(validator), 50, 0, 0, 50, 0);
+
+        // Add 9901 more. Total stake is 50 (active) + 50 (pending_inactive) + 9901 > 10000 so still exceeding max.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_pending_inactive_cannot_add_stake_if_exceeding_max_allowed(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+
+        // Leave validator set so validator is in pending_inactive state.
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+
+        // Add 9901 more. Total stake is 50 (active) + 50 (pending_inactive) + 9901 > 10000 so still exceeding max.
+        mint_and_add_stake(validator_1, 9901);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_end_to_end(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Validator has a lockup now that they've joined the validator set.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+
+        // Validator adds more stake while already being active.
+        // The added stake should go to pending_active to wait for activation when next epoch starts.
+        mint(validator, 900);
+        add_stake(validator, 100);
+        assert!(coin::balance<SupraCoin>(validator_address) == 800, 2);
+        assert_validator_state(validator_address, 100, 0, 100, 0, 0);
+
+        // Pending_active stake is activated in the new epoch.
+        // Rewards of 1 coin are also distributed for the existing active stake of 100 coins.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 3);
+        assert_validator_state(validator_address, 201, 0, 0, 0, 0);
+
+        // Request unlock of 100 coins. These 100 coins are moved to pending_inactive and will be unlocked when the
+        // current lockup expires.
+        unlock(validator, 100);
+        assert_validator_state(validator_address, 101, 0, 0, 100, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // The first epoch after the lockup cycle ended should automatically move unlocked (pending_inactive) stake
+        // to inactive.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        // Rewards were also minted to pending_inactive, which got all moved to inactive.
+        assert_validator_state(validator_address, 102, 101, 0, 0, 0);
+        // Lockup is renewed and validator is still active.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 4);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 5);
+
+        // Validator withdraws from inactive stake multiple times.
+        withdraw(validator, 50);
+        assert!(coin::balance<SupraCoin>(validator_address) == 850, 6);
+        assert_validator_state(validator_address, 102, 51, 0, 0, 0);
+        withdraw(validator, 51);
+        assert!(coin::balance<SupraCoin>(validator_address) == 901, 7);
+        assert_validator_state(validator_address, 102, 0, 0, 0, 0);
+
+        // Enough time has passed again and the validator's lockup is renewed once more. Validator is still active.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 8);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 9);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_inactive_validator_with_existing_lockup_join_validator_set(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, false, false);
+
+        // Validator sets lockup before even joining the set and lets half of lockup pass by.
+        increase_lockup(validator);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS / 2);
+        let validator_address = signer::address_of(validator);
+        assert!(
+            get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS / 2,
+            1
+        );
+
+        // Join the validator set with an existing lockup
+        join_validator_set(validator, validator_address);
+
+        // Validator is added to the set but lockup time shouldn't have changed.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS / 2 - EPOCH_DURATION,
+            3
+        );
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10012, location = Self)]
+    public entry fun test_cannot_reduce_lockup(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, false, false);
+
+        // Increase lockup.
+        increase_lockup(validator);
+        // Reduce recurring lockup to 1 second; the staged update applies at the boundary.
+        staking_config::update_recurring_lockup_duration_secs(supra_framework, 1);
+        staking_config::on_new_epoch();
+        // Increase lockup should now fail because the new lockup < old lockup.
+        increase_lockup(validator);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_inactive_validator_cannot_join_if_exceed_increase_limit(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+
+        // Validator 1 needs to be in the set so validator 2's added stake counts against the limit.
+        join_validator_set(validator_1, signer::address_of(validator_1));
+        end_epoch();
+
+        // Validator 2 joins the validator set but their stake would lead to exceeding the voting power increase limit.
+        // Therefore, this should fail.
+        join_validator_set(validator_2, signer::address_of(validator_2));
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_pending_active_validator_can_add_more_stake(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            10000
+        );
+        // Need 1 validator to be in the active validator set so joining limit works.
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, false, true);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+
+        // Add more stake while still pending_active.
+        let validator_2_address = signer::address_of(validator_2);
+        join_validator_set(validator_2, validator_2_address);
+        assert!(
+            get_validator_state(validator_2_address) == VALIDATOR_STATUS_PENDING_ACTIVE,
+            0
+        );
+        mint_and_add_stake(validator_2, 100);
+        assert_validator_state(validator_2_address, 200, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_pending_active_validator_cannot_add_more_stake_than_limit(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // 100% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100
+        );
+        // Need 1 validator to be in the active validator set so joining limit works.
+        let (_sk_1, pk_1) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+
+        // Validator 2 joins the validator set but epoch has not ended so they're still pending_active.
+        // Current voting power increase is already 100%. This is not failing yet.
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_2, validator_2, 100, true, false);
+
+        // Add more stake, which now exceeds the 100% limit. This should fail.
+        mint_and_add_stake(validator_2, 1);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_pending_active_validator_leaves_validator_set(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // Validator joins but epoch hasn't ended, so the validator is still pending_active.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, false);
+        let validator_address = signer::address_of(validator);
+        assert!(
+            get_validator_state(validator_address) == VALIDATOR_STATUS_PENDING_ACTIVE,
+            0
+        );
+
+        // Check that voting power increase is tracked.
+        assert!(
+            borrow_global<ValidatorSet>(@supra_framework).total_joining_power == 100, 0
+        );
+
+        // Leave the validator set immediately.
+        leave_validator_set(validator, validator_address);
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 1);
+
+        // Check that voting power increase has been decreased when the pending active validator leaves.
+        assert!(
+            borrow_global<ValidatorSet>(@supra_framework).total_joining_power == 0, 1
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_active_validator_cannot_add_more_stake_than_limit_in_multiple_epochs(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        // Add initial stake and join the validator set.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+        end_epoch();
+        assert_validator_state(validator_address, 110, 0, 0, 0, 0);
+        end_epoch();
+        assert_validator_state(validator_address, 121, 0, 0, 0, 0);
+        // Add more than 50% limit. The following line should fail.
+        mint_and_add_stake(validator, 99);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_active_validator_cannot_add_more_stake_than_limit(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Add more than 50% limit. This should fail.
+        mint_and_add_stake(validator, 51);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_unlock_partial_stake(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Reward rate = 10%.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Unlock half of the coins.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // 50 coins should have unlocked while the remaining 51 (50 + rewards) should stay locked for another cycle.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        // Validator received rewards in both active and pending inactive.
+        assert_validator_state(validator_address, 55, 55, 0, 0, 0);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 3);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_can_withdraw_all_stake_and_rewards_at_once(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+
+        // One more epoch passes to generate rewards.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 1);
+        assert_validator_state(validator_address, 101, 0, 0, 0, 0);
+
+        // Unlock all coins while still having a lockup.
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS - EPOCH_DURATION,
+            2
+        );
+        unlock(validator, 101);
+        assert_validator_state(validator_address, 0, 0, 0, 101, 0);
+
+        // One more epoch passes while the current lockup cycle (3600 secs) has not ended.
+        timestamp::fast_forward_seconds(1000);
+        end_epoch();
+        // Validator should not be removed from the validator set since their 100 coins in pending_inactive state should
+        // still count toward voting power.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 3);
+        assert_validator_state(validator_address, 0, 0, 0, 102, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended. Funds are now fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert_validator_state(validator_address, 0, 103, 0, 0, 0);
+        // Validator ahs been kicked out of the validator set as their stake is 0 now.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 4);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_unlocking_more_than_available_stake_should_cap(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, false, false);
+
+        // Validator unlocks more stake than they have active. This should limit the unlock to 100.
+        unlock(validator, 200);
+        assert_validator_state(signer::address_of(validator), 0, 0, 0, 100, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_withdraw_should_cap_by_inactive_stake(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        // Initial balance = 900 (idle) + 100 (staked) = 1000.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        mint(validator, 900);
+
+        // Validator unlocks stake.
+        unlock(validator, 100);
+        // Enough time has passed so the stake is fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Validator can only withdraw a max of 100 unlocked coins even if they request to withdraw more than 100.
+        withdraw(validator, 200);
+        let validator_address = signer::address_of(validator);
+        // Receive back all coins with an extra 1 for rewards.
+        assert!(coin::balance<SupraCoin>(validator_address) == 1001, 2);
+        assert_validator_state(validator_address, 0, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_can_reactivate_pending_inactive_stake(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Validator unlocks stake, which gets moved into pending_inactive.
+        unlock(validator, 50);
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+
+        // Validator can reactivate pending_inactive stake.
+        reactivate_stake(validator, 50);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_reactivate_more_than_available_pending_inactive_stake_should_cap(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Validator tries to reactivate more than available pending_inactive stake, which should limit to 50.
+        unlock(validator, 50);
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+        reactivate_stake(validator, 51);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_active_validator_having_insufficient_remaining_stake_after_withdrawal_gets_kicked(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        // Unlock enough coins that the remaining is not enough to meet the min required.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // 50 coins should have unlocked while the remaining 51 (50 + rewards) is not enough so the validator is kicked
+        // from the validator set.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 2);
+        assert_validator_state(validator_address, 50, 50, 0, 0, 0);
+        // Lockup is no longer renewed since the validator is no longer a part of the validator set.
+        assert!(get_remaining_lockup_secs(validator_address) == 0, 3);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_leaves_staking_but_still_has_a_lockup(
+        supra_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+
+        // Leave the validator set while still having a lockup.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+        leave_validator_set(validator, validator_address);
+        // Validator is in pending_inactive state but is technically still part of the validator set.
+        assert!(
+            get_validator_state(validator_address) == VALIDATOR_STATUS_PENDING_INACTIVE,
+            2
+        );
+        assert_validator_state(validator_address, 100, 0, 0, 0, 1);
+        end_epoch();
+
+        // Epoch has ended so validator is no longer part of the validator set.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 3);
+        // However, their stake, including rewards, should still subject to the existing lockup.
+        assert_validator_state(validator_address, 101, 0, 0, 0, 1);
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS - EPOCH_DURATION,
+            4
+        );
+
+        // If they try to unlock, their stake is moved to pending_inactive and would only be withdrawable after the
+        // lockup has expired.
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 51, 0, 0, 50, 1);
+        // A couple of epochs passed but lockup has not expired so the validator's stake remains the same.
+        end_epoch();
+        end_epoch();
+        end_epoch();
+        assert_validator_state(validator_address, 51, 0, 0, 50, 1);
+        // Fast forward enough so the lockup expires. Now the validator can just call withdraw directly to withdraw
+        // pending_inactive stakes.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        withdraw(validator, 50);
+        assert_validator_state(validator_address, 51, 0, 0, 0, 1);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_leaves_staking_and_rejoins_with_expired_lockup_should_be_renewed(
+        supra_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+
+        // Leave the validator set while still having a lockup.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+        leave_validator_set(validator, validator_address);
+        end_epoch();
+
+        // Fast forward enough so the lockup expires.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        assert!(get_remaining_lockup_secs(validator_address) == 0, 1);
+
+        // Validator rejoins the validator set. Once the current epoch ends, their lockup should be automatically
+        // renewed.
+        join_validator_set(validator, validator_address);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 2);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_pending_inactive_validator_does_not_count_in_increase_limit(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+
+        // Validator 1 leaves the validator set. Epoch has not ended so they're still pending_inactive.
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+        // Validator 1 adds more stake. This should not succeed as it should not count as a voting power increase.
+        mint_and_add_stake(validator_1, 51);
+    }
+
+    #[
+        test(
+            supra_framework = @0x1,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    public entry fun test_multiple_validators_join_and_leave(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+        let validator_3_address = signer::address_of(validator_3);
+
+        initialize_for_test_custom(
+            supra_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+        let (_sk_1, pk_1) = generate_identity();
+        let pk_1_bytes = validator_public_keys::public_key_to_bytes(pk_1);
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+        initialize_test_validator(&pk_3, validator_3, 100, false, false);
+
+        // Validator 1 and 2 join the validator set.
+        join_validator_set(validator_2, validator_2_address);
+        join_validator_set(validator_1, validator_1_address);
+        end_epoch();
+        assert!(get_validator_state(validator_1_address) == VALIDATOR_STATUS_ACTIVE, 0);
+        assert!(get_validator_state(validator_2_address) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // Validator indices is the reverse order of the joining order.
+        assert_validator_state(validator_1_address, 100, 0, 0, 0, 0);
+        assert_validator_state(validator_2_address, 100, 0, 0, 0, 1);
+        let validator_set = borrow_global<ValidatorSet>(@supra_framework);
+        let validator_config_1 = vector::borrow(&validator_set.active_validators, 0);
+        assert!(validator_config_1.addr == validator_1_address, 2);
+        assert!(validator_config_1.config.validator_index == 0, 3);
+        let validator_config_2 = vector::borrow(&validator_set.active_validators, 1);
+        assert!(validator_config_2.addr == validator_2_address, 4);
+        assert!(validator_config_2.config.validator_index == 1, 5);
+
+        // Validator 1 rotates consensus key. Validator 2 leaves. Validator 3 joins.
+        let (sk_1b, pk_1b) = generate_identity();
+        // `pk_1b_bytes` is the canonical (PoP-stripped) form the contract stores; the submission
+        // carries the appended PoP.
+        let pk_1b_bytes = validator_public_keys::public_key_to_bytes(pk_1b);
+        rotate_consensus_key(
+            validator_1,
+            validator_1_address,
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_1b, &pk_1b)
+        );
+        leave_validator_set(validator_2, validator_2_address);
+        join_validator_set(validator_3, validator_3_address);
+        // Validator 2 is not effectively removed until next epoch.
+        assert!(
+            get_validator_state(validator_2_address)
+                == VALIDATOR_STATUS_PENDING_INACTIVE,
+            6
+        );
+        assert!(
+            vector::borrow(
+                &borrow_global<ValidatorSet>(@supra_framework).pending_inactive,
+                0
+            ).addr == validator_2_address,
+            0
+        );
+        // Validator 3 is not effectively added until next epoch.
+        assert!(
+            get_validator_state(validator_3_address) == VALIDATOR_STATUS_PENDING_ACTIVE,
+            7
+        );
+        assert!(
+            vector::borrow(
+                &borrow_global<ValidatorSet>(@supra_framework).pending_active,
+                0
+            ).addr == validator_3_address,
+            0
+        );
+        assert!(
+            vector::borrow(
+                &borrow_global<ValidatorSet>(@supra_framework).active_validators,
+                0
+            ).config.consensus_pubkey == pk_1_bytes,
+            0
+        );
+
+        // Changes applied after new epoch
+        end_epoch();
+        assert!(get_validator_state(validator_1_address) == VALIDATOR_STATUS_ACTIVE, 8);
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 0);
+        assert!(get_validator_state(validator_2_address) == VALIDATOR_STATUS_INACTIVE, 9);
+        // The validator index of validator 2 stays the same but this doesn't matter as the next time they rejoin the
+        // validator set, their index will get set correctly.
+        assert_validator_state(validator_2_address, 101, 0, 0, 0, 1);
+        assert!(get_validator_state(validator_3_address) == VALIDATOR_STATUS_ACTIVE, 10);
+        assert_validator_state(validator_3_address, 100, 0, 0, 0, 1);
+        assert!(
+            vector::borrow(
+                &borrow_global<ValidatorSet>(@supra_framework).active_validators,
+                0
+            ).config.consensus_pubkey == pk_1b_bytes,
+            0
+        );
+
+        // Validators without enough stake will be removed.
+        unlock(validator_1, 50);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(
+            get_validator_state(validator_1_address) == VALIDATOR_STATUS_INACTIVE, 11
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_delegated_staking_with_owner_cap(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 0, false, false);
+        let owner_cap = extract_owner_cap(validator);
+
+        // Add stake when the validator is not yet activated.
+        add_stake_with_cap(&owner_cap, mint_coins(100));
+        let pool_address = signer::address_of(validator);
+        assert_validator_state(pool_address, 100, 0, 0, 0, 0);
+
+        // Join the validator set with enough stake.
+        join_validator_set(validator, pool_address);
+        end_epoch();
+        assert!(get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 0);
+
+        // Unlock the entire stake.
+        unlock_with_cap(100, &owner_cap);
+        assert_validator_state(pool_address, 0, 0, 0, 100, 0);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Withdraw stake + rewards.
+        assert_validator_state(pool_address, 0, 101, 0, 0, 0);
+        let coins = withdraw_with_cap(&owner_cap, 101);
+        assert!(coin::value(&coins) == 101, 1);
+        assert_validator_state(pool_address, 0, 0, 0, 0, 0);
+
+        // Operator can separately rotate consensus key.
+        let (sk_new, pk_new) = generate_identity();
+        // `pk_new_bytes` is the canonical (PoP-stripped) form the contract stores; the submission
+        // carries the appended PoP.
+        let pk_new_bytes = validator_public_keys::public_key_to_bytes(pk_new);
+        rotate_consensus_key(
+            validator,
+            pool_address,
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new)
+        );
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(validator_config.consensus_pubkey == pk_new_bytes, 2);
+
+        // Operator can update network and fullnode addresses.
+        update_network_and_fullnode_addresses(validator, pool_address, b"1", b"2");
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(validator_config.network_addresses == b"1", 3);
+        assert!(validator_config.fullnode_addresses == b"2", 4);
+
+        // Cleanups.
+        coin::register<SupraCoin>(validator);
+        coin::deposit(pool_address, coins);
+        deposit_owner_cap(validator, owner_cap);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000A, location = Self)]
+    public entry fun test_validator_cannot_join_post_genesis(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            false,
+            1,
+            100,
+            100
+        );
+
+        // Joining the validator set should fail as post genesis validator set change is not allowed.
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000E, location = Self)]
+    public entry fun test_invalid_pool_address(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+        join_validator_set(validator, @0x234);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000A, location = Self)]
+    public entry fun test_validator_cannot_leave_post_genesis(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            false,
+            1,
+            100,
+            100
+        );
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, false, false);
+
+        // Bypass the check to join. This is the same function called during Genesis.
+        let validator_address = signer::address_of(validator);
+        join_validator_set_internal(validator, validator_address);
+        end_epoch();
+
+        // Leaving the validator set should fail as post genesis validator set change is not allowed.
+        leave_validator_set(validator, validator_address);
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @supra_framework,
+            validator_2 = @0x2,
+            validator_3 = @0x3,
+            validator_4 = @0x4,
+            validator_5 = @0x5
+        )
+    ]
+    fun test_validator_consensus_infos_from_validator_set(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer,
+        validator_4: &signer,
+        validator_5: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let v1_addr = signer::address_of(validator_1);
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+        let v4_addr = signer::address_of(validator_4);
+        let v5_addr = signer::address_of(validator_5);
+
+        initialize_for_test(supra_framework);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        let (_sk_4, pk_4) = generate_identity();
+        let (_sk_5, pk_5) = generate_identity();
+        // let pk_1_bytes = bls12381::public_key_to_bytes(&pk_1);
+        // let pk_3_bytes = bls12381::public_key_to_bytes(&pk_3);
+        // let pk_5_bytes = bls12381::public_key_to_bytes(&pk_5);
+
+        initialize_test_validator(&pk_1, validator_1, 101, false, false);
+        initialize_test_validator(&pk_2, validator_2, 102, false, false);
+        initialize_test_validator(&pk_3, validator_3, 103, false, false);
+        initialize_test_validator(&pk_4, validator_4, 104, false, false);
+        initialize_test_validator(&pk_5, validator_5, 105, false, false);
+
+        join_validator_set(validator_3, v3_addr);
+        join_validator_set(validator_1, v1_addr);
+        join_validator_set(validator_5, v5_addr);
+        end_epoch();
+        let vci_vec_0 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@supra_framework)
+            );
+        let vci_addrs = vector::map_ref(
+            &vci_vec_0,
+            |obj| {
+                let vci: &ValidatorConsensusInfo = obj;
+                validator_consensus_info::get_addr(vci)
+            }
+        );
+        let vci_voting_powers = vector::map_ref(
+            &vci_vec_0,
+            |obj| {
+                let vci: &ValidatorConsensusInfo = obj;
+                validator_consensus_info::get_voting_power(vci)
+            }
+        );
+        assert!(
+            vector[@0x5, @supra_framework, @0x3] == vci_addrs,
+            1
+        );
+        // assert!(vector[pk_5_bytes, pk_1_bytes, pk_3_bytes] == vci_pks, 2);
+        assert!(vector[105, 101, 103] == vci_voting_powers, 3);
+        leave_validator_set(validator_3, v3_addr);
+        let vci_vec_1 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@supra_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_1, 11);
+        join_validator_set(validator_2, v2_addr);
+        let vci_vec_2 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@supra_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_2, 12);
+        leave_validator_set(validator_1, v1_addr);
+        let vci_vec_3 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@supra_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_3, 13);
+        join_validator_set(validator_4, v4_addr);
+        let vci_vec_4 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@supra_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_4, 14);
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @supra_framework,
+            validator_2 = @0x2,
+            validator_3 = @0x3,
+            validator_4 = @0x4,
+            validator_5 = @0x5
+        )
+    ]
+    public entry fun test_staking_validator_index(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer,
+        validator_4: &signer,
+        validator_5: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        let v1_addr = signer::address_of(validator_1);
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+        let v4_addr = signer::address_of(validator_4);
+        let v5_addr = signer::address_of(validator_5);
+
+        initialize_for_test(supra_framework);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        let (_sk_4, pk_4) = generate_identity();
+        let (_sk_5, pk_5) = generate_identity();
+
+        initialize_test_validator(&pk_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, validator_2, 100, false, false);
+        initialize_test_validator(&pk_3, validator_3, 100, false, false);
+        initialize_test_validator(&pk_4, validator_4, 100, false, false);
+        initialize_test_validator(&pk_5, validator_5, 100, false, false);
+
+        join_validator_set(validator_3, v3_addr);
+        end_epoch();
+        assert!(get_validator_index(v3_addr) == 0, 0);
+
+        join_validator_set(validator_4, v4_addr);
+        end_epoch();
+        assert!(get_validator_index(v3_addr) == 0, 1);
+        assert!(get_validator_index(v4_addr) == 1, 2);
+
+        join_validator_set(validator_1, v1_addr);
+        join_validator_set(validator_2, v2_addr);
+        // pending_inactive is appended in reverse order
+        end_epoch();
+        assert!(get_validator_index(v3_addr) == 0, 6);
+        assert!(get_validator_index(v4_addr) == 1, 7);
+        assert!(get_validator_index(v2_addr) == 2, 8);
+        assert!(get_validator_index(v1_addr) == 3, 9);
+
+        join_validator_set(validator_5, v5_addr);
+        end_epoch();
+        assert!(get_validator_index(v3_addr) == 0, 10);
+        assert!(get_validator_index(v4_addr) == 1, 11);
+        assert!(get_validator_index(v2_addr) == 2, 12);
+        assert!(get_validator_index(v1_addr) == 3, 13);
+        assert!(get_validator_index(v5_addr) == 4, 14);
+
+        // after swap remove, it's 3,4,2,5
+        leave_validator_set(validator_1, v1_addr);
+        // after swap remove, it's 5,4,2
+        leave_validator_set(validator_3, v3_addr);
+        end_epoch();
+
+        assert!(get_validator_index(v5_addr) == 0, 15);
+        assert!(get_validator_index(v4_addr) == 1, 16);
+        assert!(get_validator_index(v2_addr) == 2, 17);
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345,
+            validator_4 = @0x456
+        )
+    ]
+    public entry fun test_next_validator_consensus_infos_matches_committed_set(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer,
+        validator_4: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+        let v4_addr = signer::address_of(validator_4);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        let (_sk_4, pk_4) = generate_identity();
+
+        // Three active validators; validator_3 stays out for now.
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 1000, true, false);
+        initialize_test_validator(&pk_4, validator_4, 100, true, true);
+        initialize_test_validator(&pk_3, validator_3, 100, false, false);
+
+        // Cover every membership transition the next-set computation must agree on:
+        // validator_3 is a pending_active joiner (with exactly the minimum stake),
+        // validator_4 a pending_inactive leaver, and validator_2 keeps pending_inactive
+        // stake with an unexpired lockup (which counts as voting power).
+        join_validator_set(validator_3, v3_addr);
+        unlock(validator_2, 500);
+        leave_validator_set(validator_4, v4_addr);
+
+        // Mirror `end_epoch`, but capture the preview inside the reconfiguration window,
+        // exactly when the DKG receiver committee is computed in production.
+        set_validator_perf_at_least_one_block();
+        timestamp::fast_forward_seconds(EPOCH_DURATION);
+        reconfiguration_state::on_reconfig_start();
+        let preview = next_validator_consensus_infos();
+        on_new_epoch();
+        reconfiguration_state::on_reconfig_finish();
+
+        // The preview must equal the committed set: same members, same order (and thus
+        // validator indices), same consensus keys, same voting powers.
+        let committed = cur_validator_consensus_infos();
+        assert!(vector::length(&committed) == 3, 0);
+        assert!(preview == committed, 1);
+
+        // Pin the reward semantics behind the equality: validator_2 earned 1% on both its
+        // active stake (500 -> 505) and its unexpired pending_inactive stake (500 -> 505),
+        // but voting power is stake alone: the rewards start counting from the next epoch,
+        // when they are part of the pool's stake.
+        assert_validator_state(v2_addr, 505, 0, 0, 505, 1);
+        assert!(
+            validator_consensus_info::get_voting_power(vector::borrow(&committed, 1))
+                == 1000,
+            2
+        );
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    public entry fun test_joiner_expired_lockup_pending_inactive_is_not_voting_power(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+
+        // validator_1 anchors the set; the other two stay out for now. A pool that has
+        // never been in the set keeps `locked_until_secs == 0`, so its lockup counts as
+        // already expired at both the admission gate and the next epoch boundary.
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_2, validator_2, 150, false, false);
+        initialize_test_validator(&pk_3, validator_3, 200, false, false);
+
+        // Both joiners unlock part of their stake before joining, leaving it in
+        // pending_inactive with an expired lockup. That stake never becomes active voting
+        // stake (it moves to inactive at the joiner's first post-activation boundary), so
+        // it counts toward neither the admission gate nor the boundary voting power.
+        unlock(validator_2, 100); // 50 active + 100 pending_inactive
+        unlock(validator_3, 50); // 150 active + 50 pending_inactive
+
+        // validator_2's countable stake (50) is below the minimum (100): the admission gate
+        // rejects it up front, by the same rule the boundary would apply.
+        assert!(!join_validator_set_would_pass_minimum_for_test(v2_addr), 0);
+        // validator_3's countable stake (150) clears the minimum and it joins.
+        join_validator_set(validator_3, v3_addr);
+
+        end_epoch();
+
+        // validator_3 is admitted, but only its countable stake becomes voting power:
+        // 150, not the 200 sitting in the pool.
+        assert!(get_validator_state(v3_addr) == VALIDATOR_STATUS_ACTIVE, 1);
+        let committed = cur_validator_consensus_infos();
+        assert!(vector::length(&committed) == 2, 2);
+        assert!(
+            validator_consensus_info::get_addr(vector::borrow(&committed, 1)) == v3_addr,
+            3
+        );
+        assert!(
+            validator_consensus_info::get_voting_power(vector::borrow(&committed, 1))
+                == 150,
+            4
+        );
+        assert_validator_state(v3_addr, 150, 0, 0, 50, 1);
+    }
+
+    #[test_only]
+    /// Whether `join_validator_set`'s stake-only minimum-bound check would pass for
+    /// `pool_address` right now.
+    fun join_validator_set_would_pass_minimum_for_test(
+        pool_address: address
+    ): bool acquires StakePool {
+        let stake_pool = borrow_global<StakePool>(pool_address);
+        let (minimum_stake, _) = staking_config::get_required_stake(&staking_config::get());
+        next_epoch_base_voting_power(stake_pool, timestamp::now_seconds()) >= minimum_stake
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10002, location = Self)]
+    /// The admission gate judges the minimum bound by the boundary's stake-only rule: a
+    /// joiner whose pool clears the minimum only thanks to expired-lockup pending_inactive
+    /// stake is rejected at join time with ESTAKE_TOO_LOW, instead of joining successfully
+    /// and then being silently dropped at the boundary.
+    public entry fun test_join_validator_set_rejects_expired_lockup_carried_minimum(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let v2_addr = signer::address_of(validator_2);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, true);
+        // 150 in the pool clears the minimum (100), but after unlocking 100 into
+        // pending_inactive with an expired lockup (a never-activated pool has
+        // `locked_until_secs == 0`), only 50 counts.
+        initialize_test_validator(&pk_2, validator_2, 150, false, false);
+        unlock(validator_2, 100);
+        join_validator_set(validator_2, v2_addr);
+    }
+
+    #[
+        test(
+            supra_framework = @supra_framework,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    public entry fun test_dkg_preview_snapshots_active_configs_but_matches_committed_set(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let v1_addr = signer::address_of(validator_1);
+        let v3_addr = signer::address_of(validator_3);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        let (_sk_1b, pk_1b) = generate_identity();
+
+        // Two active validators plus a pending_active joiner.
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        initialize_test_validator(&pk_3, validator_3, 100, false, false);
+        join_validator_set(validator_3, v3_addr);
+
+        // validator_1 rotates its consensus key mid-epoch. The DKG preview must keep the
+        // current-epoch key for this already-active validator while the committed set
+        // picks up the rotation.
+        let old_pk_bytes =
+            borrow_global<ValidatorConfig>(v1_addr).consensus_pubkey;
+        rotate_consensus_key_genesis(
+            validator_1,
+            v1_addr,
+            validator_public_keys::public_key_to_bytes(pk_1b)
+        );
+        let new_pk_bytes =
+            borrow_global<ValidatorConfig>(v1_addr).consensus_pubkey;
+        assert!(old_pk_bytes != new_pk_bytes, 0);
+
+        // Mirror `end_epoch`, capturing the DKG preview (the `true` variant, the actual
+        // DKG-start call site) inside the reconfiguration window. With no blocks between
+        // the preview and the commit, membership, ordering, indices and voting powers
+        // must agree; only the rotated validator's key may differ.
+        set_validator_perf_at_least_one_block();
+        timestamp::fast_forward_seconds(EPOCH_DURATION);
+        reconfiguration_state::on_reconfig_start();
+        let dkg_preview = next_epoch_validator_consensus_infos_for_dkg();
+        on_new_epoch();
+        reconfiguration_state::on_reconfig_finish();
+
+        let committed = cur_validator_consensus_infos();
+        assert!(vector::length(&dkg_preview) == 3, 1);
+        assert!(vector::length(&committed) == 3, 2);
+        let i = 0;
+        while (i < 3) {
+            let preview_info = vector::borrow(&dkg_preview, i);
+            let committed_info = vector::borrow(&committed, i);
+            assert!(
+                validator_consensus_info::get_addr(preview_info)
+                    == validator_consensus_info::get_addr(committed_info),
+                3
+            );
+            assert!(
+                validator_consensus_info::get_voting_power(preview_info)
+                    == validator_consensus_info::get_voting_power(committed_info),
+                4
+            );
+            i = i + 1;
+        };
+
+        // Actives are ordered [validator_2, validator_1] (reverse join order), then the
+        // joiner: validator_1 sits at index 1.
+        assert!(
+            validator_consensus_info::get_addr(vector::borrow(&committed, 1)) == v1_addr,
+            5
+        );
+        assert!(
+            validator_consensus_info::get_pk_bytes(vector::borrow(&dkg_preview, 1))
+                == old_pk_bytes,
+            6
+        );
+        assert!(
+            validator_consensus_info::get_pk_bytes(vector::borrow(&committed, 1))
+                == new_pk_bytes,
+            7
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    /// Eligibility is judged on stake alone: rewards cannot rescue a validator whose stake
+    /// has fallen below the minimum. validator_2's countable stake drops to 995 (< 1000)
+    /// after its unlocked 5 expires with the lockup; the ~9 it earns in rewards at the same
+    /// boundary would have carried it back over the minimum if rewards counted, but it is
+    /// ejected regardless. The rewards are still paid into the pool.
+    public entry fun test_rewards_do_not_rescue_below_minimum_stake(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            1000,
+            100000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            1000000
+        );
+
+        let v1_addr = signer::address_of(validator_1);
+        let v2_addr = signer::address_of(validator_2);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 2000, true, false);
+        initialize_test_validator(&pk_2, validator_2, 1000, true, true);
+
+        // validator_2 unlocks 5, leaving 995 active + 5 pending_inactive, and the lockup is
+        // allowed to expire so the 5 stops counting.
+        unlock(validator_2, 5);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        assert!(get_validator_state(v1_addr) == VALIDATOR_STATUS_ACTIVE, 0);
+        assert!(get_validator_state(v2_addr) == VALIDATOR_STATUS_INACTIVE, 1);
+        // The boundary still paid rewards into the pool (995 * 1% = 9) and moved the expired
+        // 5 (whose 1% reward rounds to 0) to inactive; the stake was simply not enough to
+        // stay in the set.
+        assert_stake_pool(v2_addr, 1004, 5, 0, 0);
+    }
+
+    #[test(
+        supra_framework = @supra_framework,
+        validator_1 = @0x123,
+        validator_2 = @0x234,
+        validator_3 = @0x345
+    )]
+    /// Rewards keep moving while a reconfiguration is in progress (`block_prologue` advances
+    /// `ValidatorPerformance` on every block with no reconfiguration guard), but the
+    /// next-set computation never reads them, so the set committed at the boundary must be
+    /// identical to a preview taken at DKG start - voting powers included.
+    public entry fun test_membership_immune_to_reward_movement_inside_reconfiguration(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 1000, true, true);
+        initialize_test_validator(&pk_3, validator_3, 100, false, false);
+        join_validator_set(validator_3, v3_addr);
+
+        // Mirror `end_epoch`, but move the reward state between the preview and the commit.
+        set_validator_perf_at_least_one_block();
+        timestamp::fast_forward_seconds(EPOCH_DURATION);
+        reconfiguration_state::on_reconfig_start();
+        let preview = next_validator_consensus_infos();
+
+        // validator_2 fails nine proposals inside the window, collapsing its performance
+        // ratio from 1/1 to 1/10 and with it the reward the boundary will pay.
+        let v2_index = borrow_global<ValidatorConfig>(v2_addr).validator_index;
+        update_performance_statistics(
+            option::none(),
+            vector[
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index,
+                v2_index
+            ]
+        );
+
+        on_new_epoch();
+        reconfiguration_state::on_reconfig_finish();
+
+        // The committed set is identical to the preview - members, order, indices, keys AND
+        // voting powers - because nothing the computation reads moved.
+        let committed = cur_validator_consensus_infos();
+        assert!(vector::length(&committed) == 3, 0);
+        assert!(preview == committed, 1);
+        assert!(
+            validator_consensus_info::get_voting_power(vector::borrow(&committed, 0))
+                == 1000,
+            2
+        );
+
+        // The reward state genuinely moved: the boundary paid validator_2 at the collapsed
+        // 1/10 ratio (1000 * 1% * 1/10 = 1), not the 1/1 ratio the preview saw. The payout
+        // lands in the pool and will count as voting power from the next epoch.
+        assert_stake_pool(v2_addr, 1001, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_validator_rewards_are_performance_based(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+
+        // Both validators join the set.
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+
+        // Validator 2 failed proposal.
+        let failed_proposer_indices = vector::empty<u64>();
+        let validator_1_index =
+            borrow_global<ValidatorConfig>(validator_1_address).validator_index;
+        let validator_2_index =
+            borrow_global<ValidatorConfig>(validator_2_address).validator_index;
+        vector::push_back(&mut failed_proposer_indices, validator_2_index);
+        let proposer_indices = option::some(validator_1_index);
+        update_performance_statistics(proposer_indices, failed_proposer_indices);
+        end_epoch();
+
+        // Validator 2 received no rewards. Validator 1 didn't fail proposals, so it still receives rewards.
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 100, 0, 0, 0, 0);
+
+        // Validator 2 decides to leave. Both validators failed proposals.
+        unlock(validator_2, 100);
+        leave_validator_set(validator_2, validator_2_address);
+        let failed_proposer_indices = vector::empty<u64>();
+        let validator_1_index =
+            borrow_global<ValidatorConfig>(validator_1_address).validator_index;
+        let validator_2_index =
+            borrow_global<ValidatorConfig>(validator_2_address).validator_index;
+        vector::push_back(&mut failed_proposer_indices, validator_1_index);
+        vector::push_back(&mut failed_proposer_indices, validator_2_index);
+        update_performance_statistics(option::none(), failed_proposer_indices);
+        // Fast forward so validator 2's stake is fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Validator 1 and 2 received no additional rewards due to failed proposals
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 0);
+        assert_validator_state(validator_2_address, 0, 100, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_validator_rewards_rate_decrease_over_time(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let genesis_time_in_secs = timestamp::now_seconds();
+
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+
+        // Both validators join the set.
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 1000, true, false);
+        initialize_test_validator(&pk_2, validator_2, 10000, true, true);
+
+        // One epoch passed. Validator 1 and validator 2 should receive rewards at rewards rate = 1% every epoch.
+        end_epoch();
+        assert_validator_state(validator_1_address, 1010, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10100, 0, 0, 0, 0);
+
+        // Enable rewards rate decrease. Initially rewards rate is still 1% every epoch. Rewards rate halves every year.
+        let one_year_in_secs: u64 = 31536000;
+        staking_config::initialize_rewards(
+            supra_framework,
+            fixed_point64::create_from_rational(1, 100),
+            fixed_point64::create_from_rational(3, 1000),
+            one_year_in_secs,
+            genesis_time_in_secs,
+            fixed_point64::create_from_rational(50, 100)
+        );
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[features::get_periodical_reward_rate_decrease_feature()],
+            vector[]
+        );
+
+        // For some reason, this epoch is very long. It has been 1 year since genesis when the epoch ends.
+        timestamp::fast_forward_seconds(one_year_in_secs - EPOCH_DURATION * 3);
+        end_epoch();
+        // Validator 1 and validator 2 should still receive rewards at rewards rate = 1% every epoch. Rewards rate has halved after this epoch.
+        assert_validator_state(validator_1_address, 1020, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10200, 0, 0, 0, 0);
+
+        // For some reason, this epoch is also very long. One year passed.
+        timestamp::fast_forward_seconds(one_year_in_secs - EPOCH_DURATION);
+        end_epoch();
+        // Validator 1 and validator 2 should still receive rewards at rewards rate = 0.5% every epoch. Rewards rate has halved after this epoch.
+        assert_validator_state(validator_1_address, 1025, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10250, 0, 0, 0, 0);
+
+        end_epoch();
+        // Rewards rate has halved but cannot become lower than min_rewards_rate.
+        // Validator 1 and validator 2 should receive rewards at rewards rate = 0.3% every epoch.
+        assert_validator_state(validator_1_address, 1028, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10280, 0, 0, 0, 0);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_update_performance_statistics_should_not_fail_due_to_out_of_bounds(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+
+        let validator_address = signer::address_of(validator);
+        let (_sk, pk) = generate_identity();
+        initialize_test_validator(&pk, validator, 100, true, true);
+
+        let valid_validator_index =
+            borrow_global<ValidatorConfig>(validator_address).validator_index;
+        let out_of_bounds_index = valid_validator_index + 100;
+
+        // Invalid validator index in the failed proposers vector should not lead to abort.
+        let failed_proposer_indices = vector::empty<u64>();
+        vector::push_back(&mut failed_proposer_indices, valid_validator_index);
+        vector::push_back(&mut failed_proposer_indices, out_of_bounds_index);
+        update_performance_statistics(option::none(), failed_proposer_indices);
+        end_epoch();
+
+        // Validator received no rewards due to failing to propose.
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+
+        // Invalid validator index in the proposer should not lead to abort.
+        let proposer_index_optional = option::some(out_of_bounds_index);
+        update_performance_statistics(proposer_index_optional, vector::empty<u64>());
+        end_epoch();
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000B, location = Self)]
+    public entry fun test_invalid_config(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+
+        // Call initialize_stake_owner, which only initializes the stake pool but not validator config.
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Join the validator set with enough stake. This should fail because the validator didn't initialize validator
+        // config.
+        join_validator_set(validator, validator_address);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    public entry fun test_valid_config(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorSet {
+        initialize_for_test_custom(
+            supra_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+
+        // Call initialize_stake_owner, which only initializes the stake pool but not validator config.
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Initialize validator config.
+        let validator_address = signer::address_of(validator);
+        let (sk_new, pk_new) = generate_identity();
+        let pk_new_bytes =
+            validator_public_keys::serialized_keys_with_pop_for_test(&sk_new, &pk_new);
+        rotate_consensus_key(validator, validator_address, pk_new_bytes);
+
+        // Join the validator set with enough stake. This now wouldn't fail since the validator config already exists.
+        join_validator_set(validator, validator_address);
+    }
+
+    #[test]
+    public entry fun test_rewards_calculation() {
+        let stake_amount = 2000;
+        let num_successful_proposals = 199;
+        let num_total_proposals = 200;
+        let rewards_rate = 700;
+        let rewards_rate_denominator = 777;
+        let rewards_amount =
+            calculate_rewards_amount(
+                stake_amount,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        // Consider `amount_imprecise` and `amount_precise` defined as follows:
+        // amount_imprecise = (stake_amount * rewards_rate / rewards_rate_denominator) * num_successful_proposals / num_total_proposals
+        // amount_precise = stake_amount * rewards_rate * num_successful_proposals / (rewards_rate_denominator * num_total_proposals)
+        // Although they are equivalent in the real arithmetic, they are not in the integer arithmetic due to a rounding error.
+        // With the test parameters above, `amount_imprecise` is equal to 1791 because of an unbounded rounding error
+        // while `amount_precise` is equal to 1792. We expect the output of `calculate_rewards_amount` to be 1792.
+        assert!(rewards_amount == 1792, 0);
+
+        let stake_amount = 100000000000000000;
+        let num_successful_proposals = 9999;
+        let num_total_proposals = 10000;
+        let rewards_rate = 3141592;
+        let rewards_rate_denominator = 10000000;
+        // This should not abort due to an arithmetic overflow.
+        let rewards_amount =
+            calculate_rewards_amount(
+                stake_amount,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        assert!(rewards_amount == 31412778408000000, 0);
+    }
+
+    #[test_only]
+    public fun set_validator_perf_at_least_one_block() acquires ValidatorPerformance {
+        let validator_perf = borrow_global_mut<ValidatorPerformance>(@supra_framework);
+        vector::for_each_mut(
+            &mut validator_perf.validators,
+            |validator| {
+                let validator: &mut IndividualValidatorPerformance = validator;
+                if (validator.successful_proposals + validator.failed_proposals < 1) {
+                    validator.successful_proposals = 1;
+                };
+            }
+        );
+    }
+
+    #[test(supra_framework = @0x1, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_removing_validator_from_active_set(
+        supra_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, true, true);
+        assert!(
+            vector::length(
+                &borrow_global<ValidatorSet>(@supra_framework).active_validators
+            ) == 2,
+            0
+        );
+
+        // Remove validator 1 from the active validator set. Only validator 2 remains.
+        let validator_to_remove = signer::address_of(validator_1);
+        remove_validators(supra_framework, &vector[validator_to_remove]);
+        assert!(
+            vector::length(
+                &borrow_global<ValidatorSet>(@supra_framework).active_validators
+            ) == 1,
+            0
+        );
+        assert!(
+            get_validator_state(validator_to_remove)
+                == VALIDATOR_STATUS_PENDING_INACTIVE,
+            1
+        );
+    }
+
+    #[test_only]
+    public fun end_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Set the number of blocks to 1, to give out rewards to non-failing validators.
+        set_validator_perf_at_least_one_block();
+        timestamp::fast_forward_seconds(EPOCH_DURATION);
+        reconfiguration_state::on_reconfig_start();
+        on_new_epoch();
+        reconfiguration_state::on_reconfig_finish();
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123)]
+    /// `on_new_epoch` must not require a reconfiguration to be in progress: `genesis.move`'s
+    /// `set_genesis_end` calls it directly rather than through `reconfiguration::reconfigure()`, so
+    /// `reconfiguration_state`'s `State` is present but inactive there.
+    ///
+    /// Every other route into `on_new_epoch` starts a reconfiguration first - `end_epoch` above does,
+    /// as does `reconfiguration::reconfigure()` - so this shape had no coverage at all, and a read of
+    /// the reconfiguration start time guarded on `is_initialized()` rather than `is_in_progress()`
+    /// aborted the whole genesis transaction with `ERECONFIG_NOT_IN_PROGRESS`.
+    public entry fun test_on_new_epoch_outside_a_reconfiguration(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        initialize_for_test(supra_framework);
+        let (_sk, pk) = generate_identity();
+        // Joins the set but does not end the epoch, leaving the validator in `pending_active` with
+        // the state initialized and inactive - the state genesis is in when it calls `on_new_epoch`.
+        initialize_test_validator(&pk, validator, 100, true, false);
+
+        assert!(reconfiguration_state::is_initialized(), 0);
+        assert!(!reconfiguration_state::is_in_progress(), 1);
+
+        on_new_epoch();
+
+        assert!(
+            get_validator_state(signer::address_of(validator)) == VALIDATOR_STATUS_ACTIVE,
+            2
+        );
+    }
+
+    #[test_only]
+    public fun assert_stake_pool(
+        pool_address: address,
+        active_stake: u64,
+        inactive_stake: u64,
+        pending_active_stake: u64,
+        pending_inactive_stake: u64
+    ) acquires StakePool {
+        let stake_pool = borrow_global<StakePool>(pool_address);
+        let actual_active_stake = coin::value(&stake_pool.active);
+        assert!(actual_active_stake == active_stake, actual_active_stake);
+        let actual_inactive_stake = coin::value(&stake_pool.inactive);
+        assert!(actual_inactive_stake == inactive_stake, actual_inactive_stake);
+        let actual_pending_active_stake = coin::value(&stake_pool.pending_active);
+        assert!(
+            actual_pending_active_stake == pending_active_stake,
+            actual_pending_active_stake
+        );
+        let actual_pending_inactive_stake = coin::value(&stake_pool.pending_inactive);
+        assert!(
+            actual_pending_inactive_stake == pending_inactive_stake,
+            actual_pending_inactive_stake
+        );
+    }
+
+    #[test_only]
+    public fun assert_validator_state(
+        pool_address: address,
+        active_stake: u64,
+        inactive_stake: u64,
+        pending_active_stake: u64,
+        pending_inactive_stake: u64,
+        validator_index: u64
+    ) acquires StakePool, ValidatorConfig {
+        assert_stake_pool(
+            pool_address,
+            active_stake,
+            inactive_stake,
+            pending_active_stake,
+            pending_inactive_stake
+        );
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(
+            validator_config.validator_index == validator_index,
+            validator_config.validator_index
+        );
+    }
+
+    #[test(supra_framework = @0x1, validator = @0x123)]
+    public entry fun test_allowed_validators(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorSet {
+        let addr = signer::address_of(validator);
+        let (burn, mint) = supra_coin::initialize_for_test(supra_framework);
+        configure_allowed_validators(supra_framework, vector[addr]);
+
+        account::create_account_for_test(addr);
+        coin::register<SupraCoin>(validator);
+        initialize_stake_owner(validator, 0, addr, addr);
+        coin::destroy_burn_cap(burn);
+        coin::destroy_mint_cap(mint);
+    }
+
+    #[test(supra_framework = @0x1, validator = @0x123, new_owner = @0x234)]
+    public entry fun test_voter_and_owner_cap_changes_emit_events(
+        supra_framework: &signer, validator: &signer, new_owner: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorSet {
+        let (burn, mint) = supra_coin::initialize_for_test(supra_framework);
+        let pool_address = signer::address_of(validator);
+        let new_owner_address = signer::address_of(new_owner);
+        account::create_account_for_test(pool_address);
+        coin::register<SupraCoin>(validator);
+
+        // A voter other than the owner is set through `set_delegated_voter`.
+        initialize_stake_owner(validator, 0, pool_address, @0x345);
+        set_delegated_voter(validator, @0x456);
+        let owner_cap = extract_owner_cap(validator);
+        set_delegated_voter_with_cap(&owner_cap, @0x567);
+        deposit_owner_cap(new_owner, owner_cap);
+        destroy_owner_cap(extract_owner_cap(new_owner));
+
+        assert!(
+            event::emitted_events<SetDelegatedVoter>() == vector[
+                SetDelegatedVoter { pool_address, old_voter: pool_address, new_voter: @0x345 },
+                SetDelegatedVoter { pool_address, old_voter: @0x345, new_voter: @0x456 },
+                SetDelegatedVoter { pool_address, old_voter: @0x456, new_voter: @0x567 }
+            ],
+            0
+        );
+        assert!(
+            event::emitted_events<ExtractOwnerCap>() == vector[
+                ExtractOwnerCap { owner: pool_address, pool_address },
+                ExtractOwnerCap { owner: new_owner_address, pool_address }
+            ],
+            1
+        );
+        assert!(
+            event::emitted_events<DepositOwnerCap>() == vector[
+                // The pool's creation stores its `OwnerCapability` under the owner.
+                DepositOwnerCap { owner: pool_address, pool_address },
+                DepositOwnerCap { owner: new_owner_address, pool_address }
+            ],
+            2
+        );
+        assert!(
+            event::emitted_events<DestroyOwnerCap>() == vector[
+                DestroyOwnerCap { pool_address }
+            ],
+            3
+        );
+        assert!(get_delegated_voter(pool_address) == @0x567, 4);
+
+        coin::destroy_burn_cap(burn);
+        coin::destroy_mint_cap(mint);
+    }
+
+    #[test(supra_framework = @0x1, validator = @0x123)]
+    #[expected_failure(abort_code = 0x60011, location = Self)]
+    public entry fun test_not_allowed_validators(
+        supra_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, OwnerCapability, StakePool, ValidatorSet {
+        configure_allowed_validators(supra_framework, vector[]);
+        let (burn, mint) = supra_coin::initialize_for_test(supra_framework);
+
+        let addr = signer::address_of(validator);
+        account::create_account_for_test(addr);
+        coin::register<SupraCoin>(validator);
+        initialize_stake_owner(validator, 0, addr, addr);
+        coin::destroy_burn_cap(burn);
+        coin::destroy_mint_cap(mint);
+    }
+
+    #[test_only]
+    public fun with_rewards(amount: u64): u64 {
+        let (numerator, denominator) =
+            staking_config::get_reward_rate(&staking_config::get());
+        amount + amount * numerator / denominator
+    }
+
+    #[test_only]
+    public fun get_validator_fee(validator_addr: address): u64 acquires ValidatorFees {
+        let fees_table = &borrow_global<ValidatorFees>(@supra_framework).fees_table;
+        let coin = table::borrow(fees_table, validator_addr);
+        coin::value(coin)
+    }
+
+    #[test_only]
+    public fun assert_no_fees_for_validator(validator_addr: address) acquires ValidatorFees {
+        let fees_table = &borrow_global<ValidatorFees>(@supra_framework).fees_table;
+        assert!(!table::contains(fees_table, validator_addr), 0);
+    }
+
+    #[test_only]
+    const COLLECT_AND_DISTRIBUTE_GAS_FEES: u64 = 6;
+
+    #[
+        test(
+            supra_framework = @0x1,
+            validator_1 = @0x123,
+            validator_2 = @0x234,
+            validator_3 = @0x345
+        )
+    ]
+    fun test_distribute_validator_fees(
+        supra_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+        // Make sure that fees collection and distribution is enabled.
+        features::change_feature_flags_for_testing(
+            supra_framework, vector[COLLECT_AND_DISTRIBUTE_GAS_FEES], vector[]
+        );
+        assert!(features::collect_and_distribute_gas_fees(), 0);
+
+        // Initialize staking and validator fees table.
+        initialize_for_test(supra_framework);
+        initialize_validator_fees(supra_framework);
+
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+        let validator_3_address = signer::address_of(validator_3);
+
+        // Validators join the set and epoch ends.
+        let (_sk_1, pk_1) = generate_identity();
+        let (_sk_2, pk_2) = generate_identity();
+        let (_sk_3, pk_3) = generate_identity();
+        initialize_test_validator(&pk_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, validator_2, 100, true, false);
+        initialize_test_validator(&pk_3, validator_3, 100, true, true);
+
+        // Next, simulate fees collection during three blocks, where proposers are
+        // validators 1, 2, and 1 again.
+        add_transaction_fee(validator_1_address, mint_coins(100));
+        add_transaction_fee(validator_2_address, mint_coins(500));
+        add_transaction_fee(validator_1_address, mint_coins(200));
+
+        // Fess have to be assigned to the right validators, but not
+        // distributed yet.
+        assert!(get_validator_fee(validator_1_address) == 300, 0);
+        assert!(get_validator_fee(validator_2_address) == 500, 0);
+        assert_no_fees_for_validator(validator_3_address);
+        assert_validator_state(validator_1_address, 100, 0, 0, 0, 2);
+        assert_validator_state(validator_2_address, 100, 0, 0, 0, 1);
+        assert_validator_state(validator_3_address, 100, 0, 0, 0, 0);
+
+        end_epoch();
+
+        // Epoch ended. Validators must have recieved their rewards and, most importantly,
+        // their fees.
+        assert_no_fees_for_validator(validator_1_address);
+        assert_no_fees_for_validator(validator_2_address);
+        assert_no_fees_for_validator(validator_3_address);
+        assert_validator_state(validator_1_address, 401, 0, 0, 0, 2);
+        assert_validator_state(validator_2_address, 601, 0, 0, 0, 1);
+        assert_validator_state(validator_3_address, 101, 0, 0, 0, 0);
+    }
+}
