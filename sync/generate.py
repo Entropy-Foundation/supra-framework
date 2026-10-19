@@ -398,9 +398,11 @@ def strip_specs(text, code):
     `Nop` the compiler emits for it. Every other block, which names its target
     (`spec f { ... }`, `spec module { ... }`, `spec schema ...`, `spec fun ...`,
     `spec native fun ...;`), is removed. A removed block that starts a line is
-    removed with the `///` doc comment lines directly above it, and with its own
-    lines unless code follows it on its last line, in which case the indentation
-    of its first line is kept.
+    removed with its own lines unless code follows it on its last line, in which
+    case the indentation of its first line is kept. It is also removed with the
+    `///` doc comment lines above it, which the compiler attaches to it across
+    blank lines and `//` comment lines: the removal starts at the topmost such
+    `///` line.
 
     Fails if a removed block has an attribute, which would otherwise apply to the
     next item, or if the result holds a `spec` block, an `invariant`, or an
@@ -420,14 +422,16 @@ def strip_specs(text, code):
         start, replacement = match.start(), ""
         line_start = text.rfind("\n", 0, start) + 1
         if not text[line_start:start].strip():
-            start = line_start
-            while start > 0:
-                previous = text.rfind("\n", 0, start - 1) + 1
-                line = text[previous:start]
-                doc = previous + len(line) - len(line.lstrip())
-                if not (text.startswith("///", doc) and doc in line_comments):
+            start = cursor = line_start
+            while cursor > 0:
+                previous = text.rfind("\n", 0, cursor - 1) + 1
+                line = text[previous:cursor]
+                first = previous + len(line) - len(line.lstrip())
+                if line.strip() and not (text.startswith("//", first) and first in line_comments):
                     break
-                start = previous
+                cursor = previous
+                if text.startswith("///", first):
+                    start = previous
             line_end = text.find("\n", end)
             line_end = len(text) if line_end == -1 else line_end + 1
             rest = text[end:line_end]
