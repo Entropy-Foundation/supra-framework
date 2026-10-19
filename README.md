@@ -60,7 +60,7 @@ SupraFramework = { git = "https://github.com/Entropy-Foundation/supra-framework.
 
 Each package directory holds `Move.toml` and `sources/`. Every `Move.toml` is byte-identical to the on-chain registry. Every module source is the on-chain source with its specifications removed:
 
-- every `spec ... { ... }` block that names its target (a function, struct, `module`, `schema`, `fun` or `native fun`) is removed, with any `///` doc comment directly above it. Where code or a comment follows the block on its line, the line's indentation is kept;
+- every `spec ... { ... }` block that names its target (a function, struct, `module`, `schema`, `fun` or `native fun`) is removed, with the `///` doc comment lines above it, which the compiler attaches to the block across blank lines and `//` comment lines. Where code or a comment follows the block on its line, the line's indentation is kept;
 - every `spec { ... }` statement in a function body is emptied to `spec {}`.
 
 The generator fails if a removed block has an attribute, or if the result still holds a specification construct, such as a module-level `invariant`.

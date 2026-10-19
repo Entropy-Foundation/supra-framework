@@ -870,6 +870,26 @@ class StripSpecsTest(unittest.TestCase):
             "module std::m {\n    // Kept.\n    /// Documents g.\n    fun g() {}\n}\n",
         )
 
+    def test_removes_doc_comments_separated_from_a_block_by_blank_and_comment_lines(self):
+        source = (
+            "module std::m {\n"
+            "    fun f() {}\n"
+            "\n"
+            "    // Kept.\n"
+            "\n"
+            "    /// # Helper Schema\n"
+            "\n"
+            "    // Between.\n"
+            "\n"
+            "    spec schema S {\n        x: u64;\n    }\n"
+            "}\n"
+        )
+        self.assertEqual(strip(source), "module std::m {\n    fun f() {}\n\n    // Kept.\n\n}\n")
+
+    def test_keeps_doc_comments_above_code_that_precedes_a_block(self):
+        source = "module std::m {\n    /// Documents f.\n    fun f() {}\n\n    spec f {\n    }\n}\n"
+        self.assertEqual(strip(source), "module std::m {\n    /// Documents f.\n    fun f() {}\n\n}\n")
+
     def test_keeps_spec_in_comments_and_strings(self):
         source = (
             "module std::m {\n"
