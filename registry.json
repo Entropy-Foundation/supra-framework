@@ -3,7 +3,7 @@
   "chain_id": 6,
   "genesis_hash": "0xeeedd3d4dca0feb05550909db747827a447888e3232b0d48a12fb5f52b8a8ffc",
   "retired_genesis_hashes": [],
-  "registry_sha256": "2eda580db62f0fdb4018c78b4f8be9132187c9d164dd698189a350807a27364b",
+  "registry_sha256": "f8e72f8363f671dd53cff942af9621f94d980b3e27fd2f19432b619d859f5f7c",
   "packages": [
     {
       "name": "MoveStdlib",
@@ -22,8 +22,8 @@
     },
     {
       "name": "SupraFramework",
-      "upgrade_number": "14",
-      "source_digest": "BE8B005412FB627D3DC6401E901107401ACED2A26F217897310AA440644932E1"
+      "upgrade_number": "15",
+      "source_digest": "5999C676FE5158E8253EC1884D01F33AD2840DFC0F685221B6FA014E065696BE"
     }
   ]
 }
