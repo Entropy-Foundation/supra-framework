@@ -139,6 +139,9 @@ module supra_framework::automation_registry {
     const EINVALID_CYCLE_REFUND_FEE: u64 = 48;
     /// Task owner is not eligible to receive supra.
     const EOWNER_NOT_ELIGIBLE_TO_RECEIVE_SUPRA: u64 = 50;
+    /// A user task's priority is its task index, which the registry assigns: a user task
+    /// registration whose `aux_data` carries a priority is refused.
+    const EUSER_TASK_PRIORITY_NOT_SUPPORTED: u64 = 54;
 
     /// The length of the transaction hash.
     const TXN_HASH_LENGTH: u64 = 32;
@@ -1813,7 +1816,9 @@ module supra_framework::automation_registry {
     ) acquires AutomationRegistryV2, AutomationCycleDetails, ActiveAutomationRegistryConfigV2, AutomationRefundBookkeeping {
         // Guarding registration if feature is not enabled.
         assert!(features::supra_native_automation_enabled(), EDISABLED_AUTOMATION_FEATURE);
-        let has_no_priority = check_and_validate_aux_data(&aux_data, UST);
+        // Refuses a user task whose aux data carries a priority: its priority is its task index,
+        // assigned below.
+        check_and_validate_aux_data(&aux_data, UST);
 
         let automation_registry_config = borrow_global<ActiveAutomationRegistryConfigV2>(@supra_framework);
         let automation_cycle_info = borrow_global<AutomationCycleDetails>(@supra_framework);
@@ -1865,10 +1870,8 @@ module supra_framework::automation_registry {
         automation_registry.gas_committed_for_next_epoch = committed_gas;
         let task_index = automation_registry.current_index;
 
-        if (has_no_priority) {
-            let priority = std::bcs::to_bytes(&task_index);
-            vector_utils::replace(&mut aux_data, PRIORITY_AUX_DATA_INDEX, priority);
-        };
+        let priority = std::bcs::to_bytes(&task_index);
+        vector_utils::replace(&mut aux_data, PRIORITY_AUX_DATA_INDEX, priority);
 
         let automation_task_metadata = AutomationTaskMetaData {
             task_index,
@@ -3116,8 +3119,11 @@ module supra_framework::automation_registry {
         );
     }
 
-    /// Validates auxiliary data , by checking task type and priority if any specified.
-    /// Returns true if priority is not specify, false if specified.
+    /// Validates auxiliary data, by checking the task type and the priority if one is specified.
+    /// A user task must not specify a priority, its priority is its task index, and aborts with
+    /// `EUSER_TASK_PRIORITY_NOT_SUPPORTED` if it does. A system task may specify one, which must
+    /// decode as a `u64`.
+    /// Returns true if no priority is specified, false if one is.
     fun check_and_validate_aux_data(aux_data: &vector<vector<u8>>, task_type: u8) : bool {
         assert!(vector::length(aux_data) == SUPPORTED_AUX_DATA_COUNT_MAX, EINVALID_AUX_DATA_LENGTH);
 
@@ -3130,6 +3136,7 @@ module supra_framework::automation_registry {
         // Check priority existence
         let maybe_task_priority = vector::borrow(aux_data, PRIORITY_AUX_DATA_INDEX);
         let has_no_priority = vector::is_empty(maybe_task_priority);
+        assert!(task_type != UST || has_no_priority, EUSER_TASK_PRIORITY_NOT_SUPPORTED);
         if (!has_no_priority) {
             // If there is a value specified validate that it can be converted to u64 successfully.
             // This will allow to avoid invalid task registration
@@ -3738,6 +3745,14 @@ module supra_framework::automation_registry {
     #[test]
     #[expected_failure(abort_code = 65537, location = from_bcs)]
     fun check_invalid_priority_aux_data(
+    ) {
+        let aux_data = vector[vector[GST], vector[4, 5]];
+        check_and_validate_aux_data(&aux_data, GST);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = EUSER_TASK_PRIORITY_NOT_SUPPORTED, location = Self)]
+    fun check_user_task_priority_aux_data_is_refused_before_decoding(
     ) {
         let aux_data = vector[vector[UST], vector[4, 5]];
         check_and_validate_aux_data(&aux_data, UST);
