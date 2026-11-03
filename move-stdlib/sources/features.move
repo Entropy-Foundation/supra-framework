@@ -93,14 +93,18 @@ module std::features {
         is_enabled(VM_BINARY_FORMAT_V6)
     }
 
-    /// Whether gas fees are collected and distributed to the block proposers.
+    /// Retired (Entropy-Foundation/smr-moonshot#4786): gas fee collection and distribution to block proposers
+    /// is no longer supported. The framework does not read this feature, and the transaction
+    /// epilogue burns every fee whatever its value.
     /// Lifetime: transient
     const COLLECT_AND_DISTRIBUTE_GAS_FEES: u64 = 6;
 
+    #[deprecated]
     public fun get_collect_and_distribute_gas_fees_feature(): u64 {
         COLLECT_AND_DISTRIBUTE_GAS_FEES
     }
 
+    #[deprecated]
     public fun collect_and_distribute_gas_fees(): bool acquires Features {
         is_enabled(COLLECT_AND_DISTRIBUTE_GAS_FEES)
     }

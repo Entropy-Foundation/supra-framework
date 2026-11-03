@@ -25,7 +25,7 @@ module supra_framework::stake {
     use std::vector;
     use aptos_std::ed25519;
     use aptos_std::math64::min;
-    use aptos_std::table::{Self, Table};
+    use aptos_std::table::Table;
     use supra_std::validator_public_keys::{Self, ValidatorPublicKeys};
     use supra_framework::supra_coin::SupraCoin;
     use supra_framework::account;
@@ -33,7 +33,7 @@ module supra_framework::stake {
     use supra_framework::event::{Self, EventHandle};
     use supra_framework::timestamp;
     use supra_framework::system_addresses;
-    use supra_framework::staking_config::{Self, StakingConfig, StakingRewardsConfig};
+    use supra_framework::staking_config::{Self, StakingConfig};
     use supra_framework::chain_status;
     use supra_framework::create_signer::create_signer;
     use std::dkg_committee;
@@ -86,8 +86,6 @@ module supra_framework::stake {
     const EINELIGIBLE_VALIDATOR: u64 = 17;
     /// Cannot update stake pool's lockup to earlier than current lockup.
     const EINVALID_LOCKUP: u64 = 18;
-    /// Table to store collected transaction fees for each validator already exists.
-    const EFEES_TABLE_ALREADY_EXISTS: u64 = 19;
     /// Validator set change temporarily disabled because of in-progress reconfiguration.
     const ERECONFIGURATION_IN_PROGRESS: u64 = 20;
     /// Invalid DKG public key shares.
@@ -421,37 +419,11 @@ module supra_framework::stake {
         pool_address: address
     }
 
-    /// Stores transaction fees assigned to validators. All fees are distributed to validators
-    /// at the end of the epoch.
+    /// Retired with gas fee collection and distribution (`COLLECT_AND_DISTRIBUTE_GAS_FEES`,
+    /// Entropy-Foundation/smr-moonshot#4786): it is no longer published or read, and is kept because a published
+    /// struct cannot be removed.
     struct ValidatorFees has key {
         fees_table: Table<address, Coin<SupraCoin>>
-    }
-
-    /// Initializes the resource storing information about collected transaction fees per validator.
-    /// Used by `transaction_fee.move` to initialize fee collection and distribution.
-    public(friend) fun initialize_validator_fees(
-        supra_framework: &signer
-    ) {
-        system_addresses::assert_supra_framework(supra_framework);
-        assert!(
-            !exists<ValidatorFees>(@supra_framework),
-            error::already_exists(EFEES_TABLE_ALREADY_EXISTS)
-        );
-        move_to(supra_framework, ValidatorFees { fees_table: table::new() });
-    }
-
-    /// Stores the transaction fee collected to the specified validator address.
-    public(friend) fun add_transaction_fee(
-        validator_addr: address, fee: Coin<SupraCoin>
-    ) acquires ValidatorFees {
-        let fees_table =
-            &mut borrow_global_mut<ValidatorFees>(@supra_framework).fees_table;
-        if (table::contains(fees_table, validator_addr)) {
-            let collected_fee = table::borrow_mut(fees_table, validator_addr);
-            coin::merge(collected_fee, fee);
-        } else {
-            table::add(fees_table, validator_addr, fee);
-        }
     }
 
     #[view]
@@ -1434,7 +1406,7 @@ module supra_framework::stake {
     /// Prefer this to `set_dkg_output_keys`, which recomputes the next validator set here at the end
     /// of the session instead. That recomputation is a different code path from the one that
     /// produced the session's target committee, so the two can disagree on either membership or
-    /// ordering: a length disagreement aborts, which fails the block on every node, and an ordering
+    /// ordering: a length disagreement aborts, and an ordering
     /// disagreement silently installs each validator's key share on a different validator.
     public(friend) fun set_dkg_output_keys_for_members(
         validator_addrs: vector<address>,
@@ -1494,19 +1466,12 @@ module supra_framework::stake {
 
                 // Deserialize the key.
                 //
-                // This check, and the threshold-tag check in the validation loop above, are also
-                // made in Rust: before a payload reaches `supra_dkg::finish`, the VM's DKG admission
-                // gate range-checks every tag and refuses every commitment point that
-                // `public_key_from_bytes` refuses (an encoding outside the prime-order subgroup, and
-                // the identity), so on a current binary this pair is unreachable via the DKG path.
-                //
-                // Keep them anyway. They are the only copy that lives in the framework rather than
-                // in whichever binary a validator happens to run, so they are what still holds if a
-                // node runs one whose gate predates the check; and they are the only copy that sees
-                // what is actually being installed, since the gate validates the payload as signed,
-                // which is this vector before `supra_dkg::build_committee_outputs` slices it. A
-                // change to that slicing, or to the ordering between it and here, would not fail
-                // anywhere else. See Entropy-Foundation/smr-moonshot#3631.
+                // This check, and the threshold-tag check in the validation loop above, apply to
+                // every key the framework installs, after `supra_dkg::build_committee_outputs`
+                // slices the payload, whatever checks the binary made before dispatching it.
+                // `public_key_from_bytes` refuses an encoding outside the prime-order subgroup, and
+                // the identity. A change to that slicing, or to its order relative to these checks,
+                // is checked here. See Entropy-Foundation/smr-moonshot#3631.
                 let key_opt = aptos_std::bls12381::public_key_from_bytes(*key_bytes);
                 assert!(
                     option::is_some(&key_opt),
@@ -1986,7 +1951,7 @@ module supra_framework::stake {
     /// pending inactive validators so they no longer can vote.
     /// 4. The validator's voting power in the validator set is updated to be the corresponding staking pool's voting
     /// power.
-    public(friend) fun on_new_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    public(friend) fun on_new_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         archive_current_validator_set();
 
         // Compute the next validator set before mutating any state. This is the same code
@@ -2123,13 +2088,13 @@ module supra_framework::stake {
     /// configs), and the DKG receiver committee previews it (with snapshotted configs), so the
     /// two cannot diverge structurally.
     ///
-    /// Voting power - and with it eligibility - is stake alone, never rewards or fees.
-    /// `block_prologue` advances `ValidatorPerformance` and the `ValidatorFees` table on
-    /// every block with no reconfiguration guard, so those were the only inputs that could
-    /// move between a preview taken at DKG start and the commit at the epoch boundary; stake
-    /// movements, joins, leaves and key rotations are all frozen for the whole
-    /// reconfiguration. With rewards and fees out of the computation entirely (they are paid
-    /// into the pools at the boundary and count from the next epoch), the returned set -
+    /// Voting power - and with it eligibility - is stake alone, never rewards.
+    /// `block_prologue` advances `ValidatorPerformance` on every block with no
+    /// reconfiguration guard, so it is the only input that could move between a preview taken
+    /// at DKG start and the commit at the epoch boundary; stake movements, joins, leaves and
+    /// key rotations are all frozen for the whole reconfiguration. With rewards out of the
+    /// computation entirely (they are paid into the pools at the boundary and count from the
+    /// next epoch), the returned set -
     /// membership, ordering, validator indices AND voting powers - is identical across the
     /// two reads.
     ///
@@ -2304,7 +2269,7 @@ module supra_framework::stake {
         validator_perf: &ValidatorPerformance,
         pool_address: address,
         staking_config: &StakingConfig
-    ) acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorFees {
+    ) acquires StakePool, SupraCoinCapabilities, ValidatorConfig {
         let stake_pool = borrow_global_mut<StakePool>(pool_address);
         let validator_config = borrow_global<ValidatorConfig>(pool_address);
         let cur_validator_perf = vector::borrow(
@@ -2339,16 +2304,6 @@ module supra_framework::stake {
         coin::merge(
             &mut stake_pool.active, coin::extract_all(&mut stake_pool.pending_active)
         );
-
-        // Additionally, distribute transaction fees.
-        if (features::collect_and_distribute_gas_fees()) {
-            let fees_table =
-                &mut borrow_global_mut<ValidatorFees>(@supra_framework).fees_table;
-            if (table::contains(fees_table, pool_address)) {
-                let coin = table::remove(fees_table, pool_address);
-                coin::merge(&mut stake_pool.active, coin);
-            };
-        };
 
         // Pending inactive stake is only fully unlocked and moved into inactive if the current lockup cycle has expired
         let current_lockup_expiration = stake_pool.locked_until_secs;
@@ -2597,7 +2552,7 @@ module supra_framework::stake {
         operator: &signer,
         pool_address: address,
         should_end_epoch: bool
-    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let pk_bytes = validator_public_keys::public_key_to_bytes(*pk);
         // Test fixture: rotate through the genesis (PoP-exempt) path.
         rotate_consensus_key_genesis(operator, pool_address, pk_bytes);
@@ -2610,7 +2565,7 @@ module supra_framework::stake {
     #[test_only]
     public fun fast_forward_to_unlock(
         pool_address: address
-    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires SupraCoinCapabilities, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let expiration_time = get_lockup_secs(pool_address);
         timestamp::update_global_time_for_test_secs(expiration_time);
         end_epoch();
@@ -2679,7 +2634,7 @@ module supra_framework::stake {
         amount: u64,
         should_join_validator_set: bool,
         should_end_epoch: bool
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let validator_address = signer::address_of(validator);
         if (!account::exists_at(signer::address_of(validator))) {
             account::create_account_for_test(validator_address);
@@ -2781,10 +2736,10 @@ module supra_framework::stake {
         validator_public_keys::generate_keys()
     }
 
+    #[test_only]
     /// Returns the serialized bytes of a freshly generated, unique consensus public key with a
     /// valid BLS multisig proof-of-possession appended, i.e. exactly what an operator submits to
     /// `rotate_consensus_key` under the v2 identity format (which is enabled in the test VM).
-    #[test_only]
     public fun generate_unique_consensus_pubkey_bytes(): vector<u8> {
         let (sk, pk) = generate_identity();
         validator_public_keys::serialized_keys_with_pop_for_test(&sk, &pk)
@@ -2817,7 +2772,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10016, location = Self)]
     public entry fun test_initialize_validator_rejects_duplicate_consensus_pubkey_active(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         // validator_1 joins and becomes active in the next epoch.
@@ -2830,7 +2785,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10016, location = Self)]
     public entry fun test_initialize_validator_rejects_duplicate_consensus_pubkey_pending_active(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         // validator_1 joins pending_active but no epoch transition.
@@ -2845,7 +2800,7 @@ module supra_framework::stake {
     /// identity from that key alone. Here the two validators differ in every other static key.
     public entry fun test_initialize_validator_rejects_shared_network_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2858,7 +2813,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1001B, location = Self)]
     public entry fun test_initialize_validator_rejects_shared_bls_multisig_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2871,7 +2826,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1001B, location = Self)]
     public entry fun test_initialize_validator_rejects_shared_class_group_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2884,7 +2839,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1001B, location = Self)]
     public entry fun test_initialize_validator_rejects_shared_ed25519_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2899,7 +2854,7 @@ module supra_framework::stake {
     /// in during the window between joining and the epoch transition.
     public entry fun test_initialize_validator_rejects_shared_network_key_pending_active(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2916,7 +2871,7 @@ module supra_framework::stake {
     /// are the same in both, which is what makes comparing them the right check here.
     public entry fun test_rotate_consensus_key_rejects_shared_class_group_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (sk_2, pk_2) = generate_identity();
@@ -2947,7 +2902,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -2982,7 +2937,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_3, pk_3) = generate_identity();
@@ -3006,7 +2961,7 @@ module supra_framework::stake {
     /// still holds its own key - is outside the next validator set.
     public entry fun test_join_validator_set_allows_rejoin_with_unique_key(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -3057,7 +3012,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_initialize_validator_allows_two_empty_network_addresses(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -3071,7 +3026,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10016, location = Self)]
     public entry fun test_rotate_consensus_key_rejects_duplicate(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -3086,7 +3041,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_rotate_consensus_key_allows_fresh_key(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -3099,7 +3054,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_rotate_consensus_key_allows_self_rotation(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (sk, pk) = generate_identity();
         let pk_bytes = validator_public_keys::serialized_keys_with_pop_for_test(
@@ -3115,7 +3070,7 @@ module supra_framework::stake {
     /// `set_dkg_output_keys`) and only swap the static keys. This holds under the v2 identity format.
     public entry fun test_rotate_consensus_key_preserves_threshold_keys(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // v2 is enabled by default in the test VM; this makes the dependency explicit.
         features::change_feature_flags_for_testing(
@@ -3225,7 +3180,7 @@ module supra_framework::stake {
     /// rejoin the active set.
     public entry fun test_legacy_validator_ejected_then_migrates_and_rejoins(
         supra_framework: &signer, validator_keep: &signer, validator_eject: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // Model the pre-upgrade state: disable the v2 identity format, and `SUPRA_DKG`, which
         // requires it, so a legacy (bare ed25519) consensus key can still be registered (the test
@@ -3379,7 +3334,7 @@ module supra_framework::stake {
     /// is an eligible key: the validator joins and is retained across epoch transitions.
     public entry fun test_legacy_key_is_eligible_while_dkg_and_validator_identity_v2_disabled(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let legacy_key_bytes = register_legacy_key_validator_for_test(supra_framework, validator);
         let validator_address = signer::address_of(validator);
@@ -3400,7 +3355,7 @@ module supra_framework::stake {
     /// with a v2 key is retained with a contiguous validator_index.
     public entry fun test_unrotated_legacy_key_is_ineligible_while_dkg_enabled(
         supra_framework: &signer, validator_keep: &signer, validator_legacy: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let legacy_key_bytes =
             register_legacy_key_validator_for_test(supra_framework, validator_legacy);
@@ -3452,7 +3407,7 @@ module supra_framework::stake {
     /// canonical `ValidatorPublicKeys` with the PoP stripped (parses with no trailing bytes).
     public entry fun test_rotate_consensus_key_accepts_valid_pop_and_strips_it(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -3513,7 +3468,7 @@ module supra_framework::stake {
     /// enforcement is tied to the key format, not the v2 flag.
     public entry fun test_rotate_consensus_key_fallback_verifies_pop(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -3544,7 +3499,7 @@ module supra_framework::stake {
     /// `EINVALID_PROOF_OF_POSSESSION` (24 = 0x18), exactly as under v2.
     public entry fun test_rotate_consensus_key_fallback_rejects_invalid_pop(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -3569,7 +3524,7 @@ module supra_framework::stake {
     /// aggregatable BLS key, so it is accepted without a PoP and stored unchanged.
     public entry fun test_rotate_consensus_key_fallback_accepts_legacy_ed25519(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -3742,7 +3697,7 @@ module supra_framework::stake {
     /// alone, instead of copying their keys into the session.
     public entry fun test_on_new_epoch_archives_the_outgoing_validator_set(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3779,7 +3734,7 @@ module supra_framework::stake {
     /// is what ends up stored.
     public entry fun test_set_dkg_output_keys_populates_threshold_key(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3819,7 +3774,7 @@ module supra_framework::stake {
     /// there is nothing left here to disagree with it.
     public entry fun test_set_dkg_output_keys_for_members_uses_the_given_addresses(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3855,7 +3810,7 @@ module supra_framework::stake {
     /// rejected rather than installed against a shifted ordering.
     public entry fun test_set_dkg_output_keys_for_members_rejects_a_key_count_mismatch(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3883,7 +3838,7 @@ module supra_framework::stake {
     /// validator's key is written.
     public entry fun test_set_dkg_output_keys_for_members_rejects_uninstallable_threshold_type(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3917,7 +3872,7 @@ module supra_framework::stake {
     /// submitted value.
     public entry fun test_rotate_consensus_key_discards_submitted_threshold_keys(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         features::change_feature_flags_for_testing(
             supra_framework,
@@ -3982,7 +3937,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10017, location = Self)]
     public entry fun test_update_network_addresses_rejects_duplicate(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -4047,7 +4002,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10007, location = Self)]
     public entry fun test_inactive_validator_can_add_stake_if_exceeding_max_allowed(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, false, false);
@@ -4060,7 +4015,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10007, location = Self)]
     public entry fun test_pending_active_validator_cannot_add_stake_if_exceeding_max_allowed(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             50,
@@ -4087,7 +4042,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10007, location = Self)]
     public entry fun test_active_validator_cannot_add_stake_if_exceeding_max_allowed(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // Validator joins validator set and waits for epoch end so it's in the validator set.
         let (_sk, pk) = generate_identity();
@@ -4101,7 +4056,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10007, location = Self)]
     public entry fun test_active_validator_with_pending_inactive_stake_cannot_add_stake_if_exceeding_max_allowed(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // Validator joins validator set and waits for epoch end so it's in the validator set.
         let (_sk, pk) = generate_identity();
@@ -4119,7 +4074,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10007, location = Self)]
     public entry fun test_pending_inactive_cannot_add_stake_if_exceeding_max_allowed(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -4136,7 +4091,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_end_to_end(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4192,7 +4147,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_inactive_validator_with_existing_lockup_join_validator_set(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, false, false);
@@ -4224,7 +4179,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x10012, location = Self)]
     public entry fun test_cannot_reduce_lockup(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, false, false);
@@ -4242,7 +4197,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000D, location = Self)]
     public entry fun test_inactive_validator_cannot_join_if_exceed_increase_limit(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Only 50% voting power increase is allowed in each epoch.
         initialize_for_test_custom(
             supra_framework,
@@ -4271,7 +4226,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_pending_active_validator_can_add_more_stake(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             50,
@@ -4303,7 +4258,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000D, location = Self)]
     public entry fun test_pending_active_validator_cannot_add_more_stake_than_limit(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // 100% voting power increase is allowed in each epoch.
         initialize_for_test_custom(
             supra_framework,
@@ -4331,7 +4286,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_pending_active_validator_leaves_validator_set(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // Validator joins but epoch hasn't ended, so the validator is still pending_active.
         let (_sk, pk) = generate_identity();
@@ -4361,7 +4316,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000D, location = Self)]
     public entry fun test_active_validator_cannot_add_more_stake_than_limit_in_multiple_epochs(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Only 50% voting power increase is allowed in each epoch.
         initialize_for_test_custom(
             supra_framework,
@@ -4391,7 +4346,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000D, location = Self)]
     public entry fun test_active_validator_cannot_add_more_stake_than_limit(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Only 50% voting power increase is allowed in each epoch.
         initialize_for_test_custom(
             supra_framework,
@@ -4413,7 +4368,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_unlock_partial_stake(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Reward rate = 10%.
         initialize_for_test_custom(
             supra_framework,
@@ -4447,7 +4402,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_can_withdraw_all_stake_and_rewards_at_once(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4487,7 +4442,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_unlocking_more_than_available_stake_should_cap(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, false, false);
@@ -4500,7 +4455,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_withdraw_should_cap_by_inactive_stake(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         // Initial balance = 900 (idle) + 100 (staked) = 1000.
         let (_sk, pk) = generate_identity();
@@ -4524,7 +4479,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_can_reactivate_pending_inactive_stake(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4542,7 +4497,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_reactivate_more_than_available_pending_inactive_stake_should_cap(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4558,7 +4513,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_active_validator_having_insufficient_remaining_stake_after_withdrawal_gets_kicked(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4584,7 +4539,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123, validator_2 = @0x234)]
     public entry fun test_active_validator_leaves_staking_but_still_has_a_lockup(
         supra_framework: &signer, validator: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -4633,7 +4588,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123, validator_2 = @0x234)]
     public entry fun test_active_validator_leaves_staking_and_rejoins_with_expired_lockup_should_be_renewed(
         supra_framework: &signer, validator: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -4662,7 +4617,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_pending_inactive_validator_does_not_count_in_increase_limit(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Only 50% voting power increase is allowed in each epoch.
         initialize_for_test_custom(
             supra_framework,
@@ -4699,7 +4654,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let validator_1_address = signer::address_of(validator_1);
         let validator_2_address = signer::address_of(validator_2);
         let validator_3_address = signer::address_of(validator_3);
@@ -4815,7 +4770,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_delegated_staking_with_owner_cap(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             100,
@@ -4881,7 +4836,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000A, location = Self)]
     public entry fun test_validator_cannot_join_post_genesis(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             100,
@@ -4902,7 +4857,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000E, location = Self)]
     public entry fun test_invalid_pool_address(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         initialize_test_validator(&pk, validator, 100, true, true);
@@ -4913,7 +4868,7 @@ module supra_framework::stake {
     #[expected_failure(abort_code = 0x1000A, location = Self)]
     public entry fun test_validator_cannot_leave_post_genesis(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             100,
@@ -4953,7 +4908,7 @@ module supra_framework::stake {
         validator_3: &signer,
         validator_4: &signer,
         validator_5: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let v1_addr = signer::address_of(validator_1);
         let v2_addr = signer::address_of(validator_2);
         let v3_addr = signer::address_of(validator_3);
@@ -5048,7 +5003,7 @@ module supra_framework::stake {
         validator_3: &signer,
         validator_4: &signer,
         validator_5: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         let v1_addr = signer::address_of(validator_1);
         let v2_addr = signer::address_of(validator_2);
         let v3_addr = signer::address_of(validator_3);
@@ -5121,7 +5076,7 @@ module supra_framework::stake {
         validator_2: &signer,
         validator_3: &signer,
         validator_4: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let v2_addr = signer::address_of(validator_2);
@@ -5187,7 +5142,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let v2_addr = signer::address_of(validator_2);
@@ -5255,7 +5210,7 @@ module supra_framework::stake {
     /// and then being silently dropped at the boundary.
     public entry fun test_join_validator_set_rejects_expired_lockup_carried_minimum(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let v2_addr = signer::address_of(validator_2);
@@ -5283,7 +5238,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let v1_addr = signer::address_of(validator_1);
@@ -5371,7 +5326,7 @@ module supra_framework::stake {
     /// ejected regardless. The rewards are still paid into the pool.
     public entry fun test_rewards_do_not_rescue_below_minimum_stake(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test_custom(
             supra_framework,
             1000,
@@ -5420,7 +5375,7 @@ module supra_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let v2_addr = signer::address_of(validator_2);
@@ -5481,7 +5436,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_validator_rewards_are_performance_based(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let validator_1_address = signer::address_of(validator_1);
@@ -5531,7 +5486,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_validator_rewards_rate_decrease_over_time(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let genesis_time_in_secs = timestamp::now_seconds();
@@ -5590,7 +5545,7 @@ module supra_framework::stake {
     #[test(supra_framework = @supra_framework, validator = @0x123)]
     public entry fun test_update_performance_statistics_should_not_fail_due_to_out_of_bounds(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
 
         let validator_address = signer::address_of(validator);
@@ -5743,7 +5698,7 @@ module supra_framework::stake {
     #[test(supra_framework = @0x1, validator_1 = @0x123, validator_2 = @0x234)]
     public entry fun test_removing_validator_from_active_set(
         supra_framework: &signer, validator_1: &signer, validator_2: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk_1, pk_1) = generate_identity();
         let (_sk_2, pk_2) = generate_identity();
@@ -5773,7 +5728,7 @@ module supra_framework::stake {
     }
 
     #[test_only]
-    public fun end_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    public fun end_epoch() acquires StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         // Set the number of blocks to 1, to give out rewards to non-failing validators.
         set_validator_perf_at_least_one_block();
         timestamp::fast_forward_seconds(EPOCH_DURATION);
@@ -5793,7 +5748,7 @@ module supra_framework::stake {
     /// aborted the whole genesis transaction with `ERECONFIG_NOT_IN_PROGRESS`.
     public entry fun test_on_new_epoch_outside_a_reconfiguration(
         supra_framework: &signer, validator: &signer
-    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
+    ) acquires AllowedValidators, OwnerCapability, StakePool, SupraCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet, PreviousValidatorSet {
         initialize_for_test(supra_framework);
         let (_sk, pk) = generate_identity();
         // Joins the set but does not end the epoch, leaving the validator in `pending_active` with
@@ -5948,84 +5903,5 @@ module supra_framework::stake {
         let (numerator, denominator) =
             staking_config::get_reward_rate(&staking_config::get());
         amount + amount * numerator / denominator
-    }
-
-    #[test_only]
-    public fun get_validator_fee(validator_addr: address): u64 acquires ValidatorFees {
-        let fees_table = &borrow_global<ValidatorFees>(@supra_framework).fees_table;
-        let coin = table::borrow(fees_table, validator_addr);
-        coin::value(coin)
-    }
-
-    #[test_only]
-    public fun assert_no_fees_for_validator(validator_addr: address) acquires ValidatorFees {
-        let fees_table = &borrow_global<ValidatorFees>(@supra_framework).fees_table;
-        assert!(!table::contains(fees_table, validator_addr), 0);
-    }
-
-    #[test_only]
-    const COLLECT_AND_DISTRIBUTE_GAS_FEES: u64 = 6;
-
-    #[
-        test(
-            supra_framework = @0x1,
-            validator_1 = @0x123,
-            validator_2 = @0x234,
-            validator_3 = @0x345
-        )
-    ]
-    fun test_distribute_validator_fees(
-        supra_framework: &signer,
-        validator_1: &signer,
-        validator_2: &signer,
-        validator_3: &signer
-    ) acquires AllowedValidators, SupraCoinCapabilities, OwnerCapability, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet, ValidatorFees, PreviousValidatorSet {
-        // Make sure that fees collection and distribution is enabled.
-        features::change_feature_flags_for_testing(
-            supra_framework, vector[COLLECT_AND_DISTRIBUTE_GAS_FEES], vector[]
-        );
-        assert!(features::collect_and_distribute_gas_fees(), 0);
-
-        // Initialize staking and validator fees table.
-        initialize_for_test(supra_framework);
-        initialize_validator_fees(supra_framework);
-
-        let validator_1_address = signer::address_of(validator_1);
-        let validator_2_address = signer::address_of(validator_2);
-        let validator_3_address = signer::address_of(validator_3);
-
-        // Validators join the set and epoch ends.
-        let (_sk_1, pk_1) = generate_identity();
-        let (_sk_2, pk_2) = generate_identity();
-        let (_sk_3, pk_3) = generate_identity();
-        initialize_test_validator(&pk_1, validator_1, 100, true, false);
-        initialize_test_validator(&pk_2, validator_2, 100, true, false);
-        initialize_test_validator(&pk_3, validator_3, 100, true, true);
-
-        // Next, simulate fees collection during three blocks, where proposers are
-        // validators 1, 2, and 1 again.
-        add_transaction_fee(validator_1_address, mint_coins(100));
-        add_transaction_fee(validator_2_address, mint_coins(500));
-        add_transaction_fee(validator_1_address, mint_coins(200));
-
-        // Fess have to be assigned to the right validators, but not
-        // distributed yet.
-        assert!(get_validator_fee(validator_1_address) == 300, 0);
-        assert!(get_validator_fee(validator_2_address) == 500, 0);
-        assert_no_fees_for_validator(validator_3_address);
-        assert_validator_state(validator_1_address, 100, 0, 0, 0, 2);
-        assert_validator_state(validator_2_address, 100, 0, 0, 0, 1);
-        assert_validator_state(validator_3_address, 100, 0, 0, 0, 0);
-
-        end_epoch();
-
-        // Epoch ended. Validators must have recieved their rewards and, most importantly,
-        // their fees.
-        assert_no_fees_for_validator(validator_1_address);
-        assert_no_fees_for_validator(validator_2_address);
-        assert_no_fees_for_validator(validator_3_address);
-        assert_validator_state(validator_1_address, 401, 0, 0, 0, 2);
-        assert_validator_state(validator_2_address, 601, 0, 0, 0, 1);
-        assert_validator_state(validator_3_address, 101, 0, 0, 0, 0);
     }
 }

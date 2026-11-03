@@ -1567,6 +1567,12 @@ module supra_framework::evm_settlement {
         supra_framework: &signer,
     ) acquires Escrow {
         let (burn_cap, mint_cap) = setup(supra_framework);
+        // `store_supra_coin_burn_cap` stores the burn capability in the form the value of
+        // `OPERATIONS_DEFAULT_TO_FA_SUPRA_STORE` selects when it runs at genesis:
+        // `SupraCoinCapabilities` while it is off, as on a chain created with it off.
+        features::change_feature_flags_for_testing(
+            supra_framework, vector[], vector[features::get_operations_default_to_fa_supra_store_feature()]
+        );
         transaction_fee::store_supra_coin_burn_cap(supra_framework, burn_cap);
         initialize(supra_framework);
 
@@ -3445,7 +3451,10 @@ module supra_framework::evm_settlement {
         features::change_feature_flags_for_testing(
             supra_framework,
             vector[features::get_concurrent_fungible_assets_feature()],
-            vector[],
+            vector[
+                features::get_new_accounts_default_to_fa_supra_store_feature(),
+                features::get_operations_default_to_fa_supra_store_feature(),
+            ],
         );
         let (burn_cap, mint_cap) = setup(supra_framework);
         fund(user, 10_000, &mint_cap);
@@ -3493,7 +3502,10 @@ module supra_framework::evm_settlement {
         features::change_feature_flags_for_testing(
             supra_framework,
             vector[features::get_concurrent_fungible_assets_feature()],
-            vector[],
+            vector[
+                features::get_new_accounts_default_to_fa_supra_store_feature(),
+                features::get_operations_default_to_fa_supra_store_feature(),
+            ],
         );
         let (burn_cap, mint_cap) = setup(supra_framework);
         fund(user, 10_000, &mint_cap);

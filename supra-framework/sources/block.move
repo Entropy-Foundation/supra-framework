@@ -1,9 +1,7 @@
 /// This module defines a struct storing the metadata of the block and new block events.
 module supra_framework::block {
     use std::error;
-    use std::features;
     use std::option;
-    use std::option::Option;
     use std::vector;
     use aptos_std::table_with_length::{Self, TableWithLength};
 
@@ -17,7 +15,6 @@ module supra_framework::block {
     use supra_framework::state_storage;
     use supra_framework::system_addresses;
     use supra_framework::timestamp;
-    use supra_framework::transaction_fee;
     use supra_framework::leader_ban_registry;
 
     friend supra_framework::genesis;
@@ -214,15 +211,6 @@ module supra_framework::block {
             new_block_event,
             new_block_event_v2
         );
-
-        if (features::collect_and_distribute_gas_fees()) {
-            // Assign the fees collected from the previous block to the previous block proposer.
-            // If for any reason the fees cannot be assigned, this function burns the collected coins.
-            transaction_fee::process_collected_fees();
-            // Set the proposer of this block as the receiver of the fees, so that the fees for this
-            // block are assigned to the right account.
-            transaction_fee::register_proposer_for_fee_collection(proposer);
-        };
 
         // Performance scores have to be updated before the epoch transition as the transaction that triggers the
         // transition is the last block in the previous epoch.

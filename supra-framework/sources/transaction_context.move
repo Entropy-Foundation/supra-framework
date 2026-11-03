@@ -269,12 +269,12 @@ module supra_framework::transaction_context {
         let _multisig = multisig_payload();
     }
 
+    #[test]
+    #[expected_failure(abort_code=196609, location = Self)]
     /// SUPRA_AUTOMATION_V2_1 is not in the default feature set, so calling `get_transaction_consensus_hash()`
     /// aborts at the Move-level assert with error::invalid_state(ETRANSACTION_CONTEXT_NOT_AVAILABLE).
     /// Even if the feature were enabled in a test environment, the native would also abort with
     /// the same code because there is no real user transaction context in a unit test.
-    #[test]
-    #[expected_failure(abort_code=196609, location = Self)]
     fun test_call_get_transaction_consensus_hash() {
         let _hash = get_transaction_consensus_hash();
     }

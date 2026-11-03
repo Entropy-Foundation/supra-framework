@@ -225,11 +225,14 @@ module supra_framework::leader_ban_registry {
         } else { 0 }
     }
 
-    /// Add or update the ban registry as per block metadata
+    /// Add or update the ban registry as per block metadata.
+    /// The proposer of the committed block, `_proposer_index`, is not used. A ban ends when its
+    /// duration has elapsed, and probation then ends when `get_probation_duration()` rounds have
+    /// elapsed; proposing a block ends neither.
     public(friend) fun update_ban_registry(
         current_epoch: u64,
         current_round: u64,
-        proposer_index: Option<u64>,
+        _proposer_index: Option<u64>,
         failed_proposer_indices: vector<u64>
     ) acquires BanRegistry, LatestView {
         if (!exists<BanRegistry>(@supra_framework)) { return };

@@ -24,6 +24,7 @@ module supra_framework::gas_schedule {
     friend supra_framework::reconfiguration_with_dkg;
     friend supra_framework::evm_config;
     friend supra_framework::evm_genesis_config;
+    friend supra_framework::automation_registry;
 
     /// The provided gas schedule bytes are empty or invalid
     const EINVALID_GAS_SCHEDULE: u64 = 1;
@@ -32,9 +33,10 @@ module supra_framework::gas_schedule {
     /// The storage gas config cannot be applied immediately while feature `SUPRA_DKG` is enabled; use
     /// `set_storage_gas_config_for_next_epoch()` followed by `supra_governance::reconfigure()`.
     const ESET_STORAGE_GAS_CONFIG_DISABLED_WITH_DKG: u64 = 4;
-    /// A `supra.evm.*` entry that the gas schedule's feature version requires is missing, or
-    /// `txn.min_price_per_gas_unit`, which the EVM base fee is derived from, is missing
-    const ESUPRA_EVM_GAS_ENTRY_MISSING: u64 = 5;
+    /// An entry the gas schedule's feature version requires is missing: a `supra.evm.*` entry,
+    /// `txn.min_price_per_gas_unit`, which the EVM base fee is derived from and which bounds
+    /// automation tasks, or `txn.maximum_number_of_gas_units`, which bounds automation tasks
+    const EREQUIRED_GAS_ENTRY_MISSING: u64 = 5;
     /// A `supra.evm.*` entry is zero
     const ESUPRA_EVM_GAS_ENTRY_ZERO: u64 = 6;
     /// `supra.evm.gas_price_normalization_denom` is above `MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM`
@@ -42,21 +44,33 @@ module supra_framework::gas_schedule {
     /// `supra.evm.gas_price_normalization_denom` times `txn.min_price_per_gas_unit`, the EVM base
     /// fee in wei, does not fit in a `u64`
     const ESUPRA_EVM_BASE_FEE_TOO_LARGE: u64 = 8;
-    /// EVM configuration requires a published gas schedule at `SUPRA_EVM_GAS_FEATURE_VERSION` or
-    /// above
+    /// EVM configuration requires a published gas schedule at
+    /// `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above
     const ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD: u64 = 9;
-    /// At `SUPRA_EVM_GAS_FEATURE_VERSION` or above, the schedule's keys are not in strictly
-    /// increasing byte order, which a repeated key also breaks
+    /// At `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above, the schedule's keys are not in
+    /// strictly increasing byte order, which a repeated key also breaks
     const EGAS_SCHEDULE_KEYS_NOT_IN_ORDER: u64 = 10;
+    /// A gas schedule entry is looked up while no schedule at
+    /// `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above is published. Below that version the keys
+    /// are not required to be in order, so the lookup cannot search them.
+    const EGAS_SCHEDULE_LOOKUP_UNSUPPORTED: u64 = 11;
+    /// A gas schedule entry looked up by key is not in the published schedule.
+    const EGAS_SCHEDULE_ENTRY_NOT_FOUND: u64 = 12;
 
-    /// The gas feature version from which a schedule carries the `supra.evm.*` entries. It is
-    /// `RELEASE_V1_16_SUPRA_V1_9_0` in `aptos-gas-schedule`, which binds both keys to it; a node
-    /// decoding a schedule at this version or above requires both. A test in that crate checks this
-    /// file against its own constants.
-    const SUPRA_EVM_GAS_FEATURE_VERSION: u64 = 26;
+    /// The gas feature version from which a schedule is validated when it is set
+    /// (`validate_gas_schedule`): its keys are in strictly increasing byte order, so it can be
+    /// searched by key, and it carries the `supra.evm.*` entries the EVM reads and the
+    /// per-transaction bounds the automation registry reads. It is `RELEASE_V1_16_SUPRA_V1_9_0`
+    /// in `aptos-gas-schedule`, whose `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` names it; a node
+    /// applies the same rule to every schedule at this version or above. A test in that crate
+    /// checks this file against its own constants.
+    const VALIDATED_GAS_SCHEDULE_FEATURE_VERSION: u64 = 27;
 
     /// Key of the minimum price per gas unit, in quants, that the EVM base fee is derived from.
     const TXN_MIN_PRICE_PER_GAS_UNIT_KEY: vector<u8> = b"txn.min_price_per_gas_unit";
+
+    /// Key of the largest `max_gas_amount` a Move transaction may declare.
+    const TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY: vector<u8> = b"txn.maximum_number_of_gas_units";
 
     /// The largest value a `u64` holds, which the EVM base fee in wei must not exceed.
     const MAX_U64: u128 = 18446744073709551615;
@@ -190,9 +204,10 @@ module supra_framework::gas_schedule {
 
     /// Aborts unless `gas_schedule` is valid for its feature version.
     ///
-    /// Below `SUPRA_EVM_GAS_FEATURE_VERSION` nothing is checked. At or above it:
+    /// Below `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` nothing is checked. At or above it:
     /// - the keys must be in strictly increasing byte order, so that each key appears once;
-    /// - both `supra.evm.*` entries and `txn.min_price_per_gas_unit` must be present;
+    /// - both `supra.evm.*` entries, `txn.min_price_per_gas_unit` and
+    ///   `txn.maximum_number_of_gas_units` must be present;
     /// - both `supra.evm.*` entries must be non-zero;
     /// - the normalization factor must be at most `MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM`;
     /// - the EVM base fee, the factor times `txn.min_price_per_gas_unit`, must fit in a `u64`.
@@ -204,7 +219,7 @@ module supra_framework::gas_schedule {
     /// checked here, when the schedule is set. `aptos_gas_schedule::validate_gas_schedule` states the
     /// same rule in Rust. See Entropy-Foundation/smr-moonshot#4137.
     fun validate_gas_schedule(gas_schedule: &GasScheduleV2) {
-        if (gas_schedule.feature_version < SUPRA_EVM_GAS_FEATURE_VERSION) {
+        if (gas_schedule.feature_version < VALIDATED_GAS_SCHEDULE_FEATURE_VERSION) {
             return
         };
         let entries = &gas_schedule.entries;
@@ -212,11 +227,13 @@ module supra_framework::gas_schedule {
         let cap_key = string::utf8(SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY);
         let denom_key = string::utf8(SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY);
         let min_price_key = string::utf8(TXN_MIN_PRICE_PER_GAS_UNIT_KEY);
+        let max_gas_units_key = string::utf8(TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY);
         let cap = option::none<u64>();
         let denom = option::none<u64>();
         let min_price = option::none<u64>();
+        let has_max_gas_units = false;
         let i = 0;
-        // One pass: each key is compared with the one before it, and the three values are collected.
+        // One pass: each key is compared with the one before it, and the values are collected.
         // Keys in strictly increasing order are unique, so each value is found at most once.
         while (i < len) {
             let entry = vector::borrow(entries, i);
@@ -234,14 +251,21 @@ module supra_framework::gas_schedule {
                 denom = option::some(entry.val);
             } else if (entry.key == min_price_key) {
                 min_price = option::some(entry.val);
+            } else if (entry.key == max_gas_units_key) {
+                has_max_gas_units = true;
             };
             i = i + 1;
         };
         // The minimum price is not a `supra.evm.*` entry, but the base fee is derived from it, so a
         // schedule that lacks it is refused under the same code as one that lacks either EVM entry.
+        // The automation registry reads the maximum gas units and the minimum price through
+        // `txn_gas_bounds`, including in its cycle transition, which must not abort; requiring both
+        // here is what lets that read succeed on every schedule `is_txn_gas_bounds_read_supported`
+        // admits.
         assert!(
-            option::is_some(&cap) && option::is_some(&denom) && option::is_some(&min_price),
-            error::invalid_argument(ESUPRA_EVM_GAS_ENTRY_MISSING)
+            option::is_some(&cap) && option::is_some(&denom) && option::is_some(&min_price)
+                && has_max_gas_units,
+            error::invalid_argument(EREQUIRED_GAS_ENTRY_MISSING)
         );
         let cap = option::destroy_some(cap);
         let denom = option::destroy_some(denom);
@@ -271,7 +295,8 @@ module supra_framework::gas_schedule {
         }
     }
 
-    /// Aborts unless the gas schedule in force is at `SUPRA_EVM_GAS_FEATURE_VERSION` or above.
+    /// Aborts unless the gas schedule in force is at `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or
+    /// above.
     ///
     /// Every function that publishes or buffers EVM configuration calls this first. A node running
     /// the EVM reads the `supra.evm.*` entries from every epoch's schedule and refuses a schedule
@@ -280,9 +305,78 @@ module supra_framework::gas_schedule {
     /// separate epochs, the upgrade first.
     public(friend) fun assert_supra_evm_gas_feature_version() acquires GasScheduleV2 {
         assert!(
-            published_feature_version() >= SUPRA_EVM_GAS_FEATURE_VERSION,
+            published_feature_version() >= VALIDATED_GAS_SCHEDULE_FEATURE_VERSION,
             error::invalid_state(ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD)
         );
+    }
+
+    /// Whether `txn_gas_bounds` can be read: the published schedule is at
+    /// `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above, so its keys are ordered.
+    ///
+    /// Lets a caller that must not abort, such as the automation cycle transition, skip a check
+    /// that `txn_gas_bounds` would otherwise refuse.
+    public(friend) fun is_txn_gas_bounds_read_supported(): bool acquires GasScheduleV2 {
+        published_feature_version() >= VALIDATED_GAS_SCHEDULE_FEATURE_VERSION
+    }
+
+    /// The per-transaction gas bounds of the gas schedule in force:
+    /// `(txn.maximum_number_of_gas_units, txn.min_price_per_gas_unit)`.
+    ///
+    /// The automation registry bounds a task's `max_gas_amount` and `gas_price_cap` by these, so
+    /// that it admits and keeps only tasks whose transactions the VM accepts. Both values are read
+    /// from the published `GasScheduleV2`, the same schedule the VM loads its parameters from. A
+    /// schedule buffered by `set_for_next_epoch` is not counted until `on_new_epoch` applies it,
+    /// which happens in the same transaction as the epoch change the VM reloads on.
+    ///
+    /// Aborts with `EGAS_SCHEDULE_LOOKUP_UNSUPPORTED` unless the published schedule is at
+    /// `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above, and with `EGAS_SCHEDULE_ENTRY_NOT_FOUND`
+    /// if either key is absent.
+    public(friend) fun txn_gas_bounds(): (u64, u64) acquires GasScheduleV2 {
+        // From this version on, `validate_gas_schedule` requires the keys in strictly increasing
+        // byte order, which is what makes the binary search in `entry_value` correct.
+        assert!(is_txn_gas_bounds_read_supported(), error::invalid_state(EGAS_SCHEDULE_LOOKUP_UNSUPPORTED));
+        let entries = &borrow_global<GasScheduleV2>(@supra_framework).entries;
+        (
+            entry_value(entries, TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY),
+            entry_value(entries, TXN_MIN_PRICE_PER_GAS_UNIT_KEY),
+        )
+    }
+
+    /// The gas schedule key `txn_gas_bounds` reads the maximum gas units from, for a caller that
+    /// names it, such as in an event.
+    public(friend) fun txn_maximum_number_of_gas_units_key(): vector<u8> {
+        TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY
+    }
+
+    /// The gas schedule key `txn_gas_bounds` reads the minimum gas price from.
+    public(friend) fun txn_min_price_per_gas_unit_key(): vector<u8> {
+        TXN_MIN_PRICE_PER_GAS_UNIT_KEY
+    }
+
+    /// Value of `key` in `entries`, found by binary search.
+    ///
+    /// `entries` must be in strictly increasing byte order of their keys, as a schedule at
+    /// `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` or above is. A schedule has a few hundred entries,
+    /// so the search takes about ten comparisons where a linear scan would take hundreds. Aborts
+    /// with `EGAS_SCHEDULE_ENTRY_NOT_FOUND` if `key` is absent.
+    fun entry_value(entries: &vector<GasEntry>, key: vector<u8>): u64 {
+        // Search the half-open range [low, high).
+        let low = 0;
+        let high = vector::length(entries);
+        while (low < high) {
+            let mid = low + (high - low) / 2;
+            let entry = vector::borrow(entries, mid);
+            let order = comparator::compare_u8_vector(*string::bytes(&entry.key), key);
+            if (comparator::is_equal(&order)) {
+                return entry.val
+            };
+            if (comparator::is_smaller_than(&order)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            };
+        };
+        abort error::invalid_state(EGAS_SCHEDULE_ENTRY_NOT_FOUND)
     }
 
     #[test_only]
@@ -366,12 +460,52 @@ module supra_framework::gas_schedule {
     ): GasScheduleV2 {
         GasScheduleV2 {
             feature_version,
-            // In the byte order a schedule at version 26 or above must be in.
+            // In the byte order a schedule at version 27 or above must be in.
             entries: vector[
                 GasEntry { key: string::utf8(SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY), val: denom },
                 GasEntry { key: string::utf8(SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY), val: cap },
+                GasEntry { key: string::utf8(TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY), val: DEFAULT_TEST_MAX_GAS_UNITS },
                 GasEntry { key: string::utf8(TXN_MIN_PRICE_PER_GAS_UNIT_KEY), val: min_price },
             ],
+        }
+    }
+
+    #[test_only]
+    /// `txn.maximum_number_of_gas_units` in the schedules the test helpers build. A value for tests
+    /// only; tests that depend on the bound set their own with `set_txn_gas_bounds_for_test`.
+    const DEFAULT_TEST_MAX_GAS_UNITS: u64 = 2_000_000;
+
+    #[test_only]
+    /// Sets the feature version of the published gas schedule, for tests of how readers treat a
+    /// schedule below `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION`.
+    public fun set_feature_version_for_test(supra_framework: &signer, feature_version: u64) acquires GasScheduleV2 {
+        system_addresses::assert_supra_framework(supra_framework);
+        borrow_global_mut<GasScheduleV2>(@supra_framework).feature_version = feature_version;
+    }
+
+    #[test_only]
+    /// Publishes, or replaces, a gas schedule at `VALIDATED_GAS_SCHEDULE_FEATURE_VERSION` whose
+    /// per-transaction bounds are `max_gas_units` and `min_price`, for tests of modules that read
+    /// them through `txn_gas_bounds`.
+    public fun set_txn_gas_bounds_for_test(
+        supra_framework: &signer,
+        max_gas_units: u64,
+        min_price: u64
+    ) acquires GasScheduleV2 {
+        let schedule = schedule_with_supra_evm_pricing(VALIDATED_GAS_SCHEDULE_FEATURE_VERSION, 16_777_216, 3_333_333, min_price);
+        // Found by key rather than position, so that adding an entry to the schedule above cannot
+        // make this overwrite a different one.
+        let max_gas_units_key = string::utf8(TXN_MAXIMUM_NUMBER_OF_GAS_UNITS_KEY);
+        let (found, index) = vector::find(&schedule.entries, |entry| {
+            let entry: &GasEntry = entry;
+            entry.key == max_gas_units_key
+        });
+        assert!(found, 0);
+        vector::borrow_mut(&mut schedule.entries, index).val = max_gas_units;
+        if (exists<GasScheduleV2>(@supra_framework)) {
+            *borrow_global_mut<GasScheduleV2>(@supra_framework) = schedule;
+        } else {
+            move_to(supra_framework, schedule);
         }
     }
 
@@ -387,10 +521,10 @@ module supra_framework::gas_schedule {
     #[test]
     /// The compiled defaults and the bounds themselves are accepted.
     fun test_supra_evm_entries_at_their_bounds_are_accepted() {
-        validate_gas_schedule(&schedule_with_supra_evm_entries(26, 16_777_216, 3_333_333));
-        validate_gas_schedule(&schedule_with_supra_evm_entries(26, 1, 1));
+        validate_gas_schedule(&schedule_with_supra_evm_entries(27, 16_777_216, 3_333_333));
+        validate_gas_schedule(&schedule_with_supra_evm_entries(27, 1, 1));
         validate_gas_schedule(
-            &schedule_with_supra_evm_entries(26, 18446744073709551615, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM)
+            &schedule_with_supra_evm_entries(27, 18446744073709551615, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM)
         );
     }
 
@@ -398,8 +532,8 @@ module supra_framework::gas_schedule {
     /// Below the feature version that introduces the entries, a node does not read them, so their
     /// absence or value is not checked.
     fun test_supra_evm_entries_below_their_feature_version_are_not_checked() {
-        validate_gas_schedule(&GasScheduleV2 { feature_version: 25, entries: vector[] });
-        validate_gas_schedule(&schedule_with_supra_evm_entries(25, 0, 0));
+        validate_gas_schedule(&GasScheduleV2 { feature_version: 26, entries: vector[] });
+        validate_gas_schedule(&schedule_with_supra_evm_entries(26, 0, 0));
     }
 
     #[test]
@@ -416,10 +550,10 @@ module supra_framework::gas_schedule {
 
     #[test]
     #[expected_failure(abort_code = 0x10005, location = Self)]
-    /// error::invalid_argument(ESUPRA_EVM_GAS_ENTRY_MISSING) = 0x10005.
+    /// error::invalid_argument(EREQUIRED_GAS_ENTRY_MISSING) = 0x10005.
     fun test_supra_evm_schedule_without_the_cap_is_rejected() {
         validate_gas_schedule(
-            &schedule_with_single_entry(26, SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY, 3_333_333)
+            &schedule_with_single_entry(27, SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY, 3_333_333)
         );
     }
 
@@ -427,7 +561,7 @@ module supra_framework::gas_schedule {
     #[expected_failure(abort_code = 0x10005, location = Self)]
     fun test_supra_evm_schedule_without_the_denom_is_rejected() {
         validate_gas_schedule(
-            &schedule_with_single_entry(26, SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY, 16_777_216)
+            &schedule_with_single_entry(27, SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY, 16_777_216)
         );
     }
 
@@ -435,13 +569,13 @@ module supra_framework::gas_schedule {
     #[expected_failure(abort_code = 0x10006, location = Self)]
     /// error::invalid_argument(ESUPRA_EVM_GAS_ENTRY_ZERO) = 0x10006.
     fun test_supra_evm_zero_cap_is_rejected() {
-        validate_gas_schedule(&schedule_with_supra_evm_entries(26, 0, 3_333_333));
+        validate_gas_schedule(&schedule_with_supra_evm_entries(27, 0, 3_333_333));
     }
 
     #[test]
     #[expected_failure(abort_code = 0x10006, location = Self)]
     fun test_supra_evm_zero_denom_is_rejected() {
-        validate_gas_schedule(&schedule_with_supra_evm_entries(26, 16_777_216, 0));
+        validate_gas_schedule(&schedule_with_supra_evm_entries(27, 16_777_216, 0));
     }
 
     #[test]
@@ -449,7 +583,7 @@ module supra_framework::gas_schedule {
     /// error::invalid_argument(ESUPRA_EVM_GAS_ENTRY_TOO_LARGE) = 0x10007.
     fun test_supra_evm_denom_above_bound_is_rejected() {
         validate_gas_schedule(
-            &schedule_with_supra_evm_entries(26, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM + 1)
+            &schedule_with_supra_evm_entries(27, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM + 1)
         );
     }
 
@@ -457,7 +591,7 @@ module supra_framework::gas_schedule {
     #[expected_failure(abort_code = 0x10006, location = Self)]
     /// `initialize`, which genesis calls, applies the check.
     fun test_initialize_with_zero_supra_evm_denom_is_rejected(fx: signer) {
-        initialize(&fx, to_bytes(&schedule_with_supra_evm_entries(26, 16_777_216, 0)));
+        initialize(&fx, to_bytes(&schedule_with_supra_evm_entries(27, 16_777_216, 0)));
     }
 
     #[test(fx = @0x1)]
@@ -466,14 +600,14 @@ module supra_framework::gas_schedule {
     fun test_set_gas_schedule_with_zero_supra_evm_denom_is_rejected(
         fx: signer
     ) acquires GasSchedule, GasScheduleV2 {
-        set_gas_schedule(&fx, to_bytes(&schedule_with_supra_evm_entries(26, 16_777_216, 0)));
+        set_gas_schedule(&fx, to_bytes(&schedule_with_supra_evm_entries(27, 16_777_216, 0)));
     }
 
     #[test(fx = @0x1)]
     #[expected_failure(abort_code = 0x10006, location = Self)]
     /// `set_for_next_epoch` applies the check before anything is buffered.
     fun test_set_for_next_epoch_with_zero_supra_evm_denom_is_rejected(fx: signer) acquires GasScheduleV2 {
-        set_for_next_epoch(&fx, to_bytes(&schedule_with_supra_evm_entries(26, 16_777_216, 0)));
+        set_for_next_epoch(&fx, to_bytes(&schedule_with_supra_evm_entries(27, 16_777_216, 0)));
     }
 
     #[test(fx = @0x1)]
@@ -485,7 +619,7 @@ module supra_framework::gas_schedule {
         set_for_next_epoch_check_hash(
             &fx,
             vector[],
-            to_bytes(&schedule_with_supra_evm_entries(26, 16_777_216, 0))
+            to_bytes(&schedule_with_supra_evm_entries(27, 16_777_216, 0))
         );
     }
 
@@ -494,20 +628,20 @@ module supra_framework::gas_schedule {
     /// A schedule that is both older than the current one and missing the `supra.evm.*` entries is
     /// refused for its version, the check that already ran before this one.
     fun test_old_version_is_rejected_before_supra_evm_entries_are_checked(fx: signer) acquires GasScheduleV2 {
-        move_to(&fx, schedule_with_supra_evm_entries(27, 16_777_216, 3_333_333));
-        set_for_next_epoch(&fx, to_bytes(&GasScheduleV2 { feature_version: 26, entries: vector[] }));
+        move_to(&fx, schedule_with_supra_evm_entries(28, 16_777_216, 3_333_333));
+        set_for_next_epoch(&fx, to_bytes(&GasScheduleV2 { feature_version: 27, entries: vector[] }));
     }
 
     #[test]
     /// A base fee of exactly `MAX_U64` wei is accepted, and so is a zero minimum price.
     fun test_supra_evm_base_fee_at_the_u64_bound_is_accepted() {
-        validate_gas_schedule(&schedule_with_supra_evm_pricing(26, 16_777_216, 1, 18446744073709551615));
+        validate_gas_schedule(&schedule_with_supra_evm_pricing(27, 16_777_216, 1, 18446744073709551615));
         // 10^10 * 1,844,674,407 = 18,446,744,070,000,000,000, the largest multiple of the bound
         // that fits.
         validate_gas_schedule(
-            &schedule_with_supra_evm_pricing(26, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM, 1_844_674_407)
+            &schedule_with_supra_evm_pricing(27, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM, 1_844_674_407)
         );
-        validate_gas_schedule(&schedule_with_supra_evm_pricing(26, 16_777_216, 3_333_333, 0));
+        validate_gas_schedule(&schedule_with_supra_evm_pricing(27, 16_777_216, 3_333_333, 0));
     }
 
     #[test]
@@ -516,7 +650,7 @@ module supra_framework::gas_schedule {
     /// bound; the minimum price is one above the largest whose product with it fits.
     fun test_supra_evm_base_fee_above_the_u64_bound_is_rejected() {
         validate_gas_schedule(
-            &schedule_with_supra_evm_pricing(26, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM, 1_844_674_408)
+            &schedule_with_supra_evm_pricing(27, 16_777_216, MAX_EVM_GAS_PRICE_NORMALIZATION_DENOM, 1_844_674_408)
         );
     }
 
@@ -525,7 +659,7 @@ module supra_framework::gas_schedule {
     /// A schedule carrying both EVM entries but no minimum price is refused as incomplete.
     fun test_supra_evm_schedule_without_the_min_price_is_rejected() {
         validate_gas_schedule(&GasScheduleV2 {
-            feature_version: 26,
+            feature_version: 27,
             entries: vector[
                 GasEntry { key: string::utf8(SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY), val: 3_333_333 },
                 GasEntry { key: string::utf8(SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY), val: 16_777_216 },
@@ -539,7 +673,7 @@ module supra_framework::gas_schedule {
     fun test_set_for_next_epoch_with_an_oversized_base_fee_is_rejected(fx: signer) acquires GasScheduleV2 {
         set_for_next_epoch(
             &fx,
-            to_bytes(&schedule_with_supra_evm_pricing(26, 16_777_216, 3_333_333, 10_000_000_000_000))
+            to_bytes(&schedule_with_supra_evm_pricing(27, 16_777_216, 3_333_333, 10_000_000_000_000))
         );
     }
 
@@ -547,14 +681,14 @@ module supra_framework::gas_schedule {
     /// `published_feature_version` reads the published schedule, and is 0 when none is published.
     fun test_published_feature_version_reads_the_published_schedule(fx: signer) acquires GasScheduleV2 {
         assert!(published_feature_version() == 0, 0);
-        initialize_for_test(&fx, 26);
-        assert!(published_feature_version() == 26, 1);
+        initialize_for_test(&fx, 27);
+        assert!(published_feature_version() == 27, 1);
     }
 
     #[test(fx = @0x1)]
     /// The gate accepts a schedule at the version that introduces the `supra.evm.*` entries.
     fun test_supra_evm_gate_accepts_the_introducing_version(fx: signer) acquires GasScheduleV2 {
-        initialize_for_test(&fx, 26);
+        initialize_for_test(&fx, 27);
         assert_supra_evm_gas_feature_version();
     }
 
@@ -562,7 +696,7 @@ module supra_framework::gas_schedule {
     #[expected_failure(abort_code = 0x30009, location = Self)]
     /// error::invalid_state(ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD) = 0x30009.
     fun test_supra_evm_gate_refuses_an_older_version(fx: signer) acquires GasScheduleV2 {
-        initialize_for_test(&fx, 25);
+        initialize_for_test(&fx, 26);
         assert_supra_evm_gas_feature_version();
     }
 
@@ -574,11 +708,11 @@ module supra_framework::gas_schedule {
     }
 
     #[test_only]
-    /// The schedule of `schedule_with_supra_evm_entries(26, 16_777_216, 3_333_333)` with `key` holding
+    /// The schedule of `schedule_with_supra_evm_entries(27, 16_777_216, 3_333_333)` with `key` holding
     /// `val` inserted right after its existing entry, or at the end if it has none, so that the
     /// schedule is in order apart from the repetition.
     fun schedule_with_repeated_entry(key: vector<u8>, val: u64): GasScheduleV2 {
-        let schedule = schedule_with_supra_evm_entries(26, 16_777_216, 3_333_333);
+        let schedule = schedule_with_supra_evm_entries(27, 16_777_216, 3_333_333);
         let key = string::utf8(key);
         let len = vector::length(&schedule.entries);
         let position = len;
@@ -626,7 +760,7 @@ module supra_framework::gas_schedule {
     #[expected_failure(abort_code = 0x1000a, location = Self)]
     /// Unique keys out of byte order are refused.
     fun test_gas_schedule_keys_out_of_order_are_rejected() {
-        let schedule = schedule_with_supra_evm_entries(26, 16_777_216, 3_333_333);
+        let schedule = schedule_with_supra_evm_entries(27, 16_777_216, 3_333_333);
         vector::swap(&mut schedule.entries, 0, 1);
         validate_gas_schedule(&schedule);
     }
@@ -636,7 +770,7 @@ module supra_framework::gas_schedule {
     fun test_gas_schedule_order_below_the_feature_version_is_not_checked() {
         let old = schedule_with_repeated_entry(SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY, 1);
         vector::swap(&mut old.entries, 0, 2);
-        old.feature_version = 25;
+        old.feature_version = 26;
         validate_gas_schedule(&old);
     }
 
@@ -655,7 +789,7 @@ module supra_framework::gas_schedule {
         fx: signer
     ) acquires GasSchedule, GasScheduleV2 {
         move_to(&fx, GasSchedule { entries: vector[] });
-        set_gas_schedule(&fx, to_bytes(&schedule_with_supra_evm_entries(26, 16_777_216, 0)));
+        set_gas_schedule(&fx, to_bytes(&schedule_with_supra_evm_entries(27, 16_777_216, 0)));
     }
 
     #[test]
@@ -664,12 +798,112 @@ module supra_framework::gas_schedule {
     /// `aptos_gas_schedule::validate_gas_schedule` refuses it.
     fun test_gas_schedule_order_is_reported_before_an_absence() {
         validate_gas_schedule(&GasScheduleV2 {
-            feature_version: 26,
+            feature_version: 27,
             entries: vector[
                 GasEntry { key: string::utf8(TXN_MIN_PRICE_PER_GAS_UNIT_KEY), val: 100 },
                 GasEntry { key: string::utf8(SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY), val: 3_333_333 },
                 GasEntry { key: string::utf8(TXN_MIN_PRICE_PER_GAS_UNIT_KEY), val: 100 },
             ],
         });
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0x10005, location = Self)]
+    /// The automation registry reads the maximum gas units from every schedule at version 27 or
+    /// above, so a schedule without it is refused when it is set.
+    /// error::invalid_argument(EREQUIRED_GAS_ENTRY_MISSING) = 0x10005.
+    fun test_schedule_without_the_maximum_gas_units_is_rejected() {
+        validate_gas_schedule(&GasScheduleV2 {
+            feature_version: VALIDATED_GAS_SCHEDULE_FEATURE_VERSION,
+            entries: vector[
+                GasEntry { key: string::utf8(SUPRA_EVM_GAS_PRICE_NORMALIZATION_DENOM_KEY), val: 3_333_333 },
+                GasEntry { key: string::utf8(SUPRA_EVM_MAX_TRANSACTION_GAS_LIMIT_KEY), val: 16_777_216 },
+                GasEntry { key: string::utf8(TXN_MIN_PRICE_PER_GAS_UNIT_KEY), val: 100 },
+            ],
+        });
+    }
+
+    #[test(fx = @0x1)]
+    fun test_txn_gas_bounds_reads_the_published_schedule(fx: signer) acquires GasScheduleV2 {
+        set_txn_gas_bounds_for_test(&fx, 1_234_567, 89);
+        let (max_gas_units, min_price) = txn_gas_bounds();
+        assert!(max_gas_units == 1_234_567, 0);
+        assert!(min_price == 89, 1);
+    }
+
+    #[test(fx = @0x1)]
+    fun test_txn_gas_bounds_follows_a_replaced_schedule(fx: signer) acquires GasScheduleV2 {
+        set_txn_gas_bounds_for_test(&fx, 1_000, 10);
+        set_txn_gas_bounds_for_test(&fx, 2_000, 20);
+        let (max_gas_units, min_price) = txn_gas_bounds();
+        assert!(max_gas_units == 2_000 && min_price == 20, 0);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0x3000b, location = Self)]
+    /// error::invalid_state(EGAS_SCHEDULE_LOOKUP_UNSUPPORTED) = 0x3000b.
+    fun test_txn_gas_bounds_without_a_schedule_aborts() acquires GasScheduleV2 {
+        txn_gas_bounds();
+    }
+
+    #[test(fx = @0x1)]
+    #[expected_failure(abort_code = 0x3000b, location = Self)]
+    /// Below version 27 the keys are not ordered, so the lookup refuses rather than search them.
+    fun test_txn_gas_bounds_below_the_ordered_version_aborts(fx: signer) acquires GasScheduleV2 {
+        initialize_for_test(&fx, VALIDATED_GAS_SCHEDULE_FEATURE_VERSION - 1);
+        txn_gas_bounds();
+    }
+
+    #[test(fx = @0x1)]
+    #[expected_failure(abort_code = 0x3000c, location = Self)]
+    /// error::invalid_state(EGAS_SCHEDULE_ENTRY_NOT_FOUND) = 0x3000c.
+    fun test_txn_gas_bounds_with_a_missing_entry_aborts(fx: signer) acquires GasScheduleV2 {
+        move_to(&fx, schedule_with_single_entry(
+            VALIDATED_GAS_SCHEDULE_FEATURE_VERSION,
+            TXN_MIN_PRICE_PER_GAS_UNIT_KEY,
+            100
+        ));
+        txn_gas_bounds();
+    }
+
+    #[test]
+    /// Every key of an ordered schedule is found, at each position, and keys between, before and
+    /// after them are not.
+    fun test_entry_value_finds_every_key_of_an_ordered_schedule() {
+        let entries = vector[
+            GasEntry { key: string::utf8(b"a"), val: 1 },
+            GasEntry { key: string::utf8(b"c"), val: 3 },
+            GasEntry { key: string::utf8(b"e"), val: 5 },
+            GasEntry { key: string::utf8(b"g"), val: 7 },
+            GasEntry { key: string::utf8(b"i"), val: 9 },
+        ];
+        assert!(entry_value(&entries, b"a") == 1, 0);
+        assert!(entry_value(&entries, b"c") == 3, 1);
+        assert!(entry_value(&entries, b"e") == 5, 2);
+        assert!(entry_value(&entries, b"g") == 7, 3);
+        assert!(entry_value(&entries, b"i") == 9, 4);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0x3000c, location = Self)]
+    fun test_entry_value_key_between_entries_aborts() {
+        let entries = vector[
+            GasEntry { key: string::utf8(b"a"), val: 1 },
+            GasEntry { key: string::utf8(b"c"), val: 3 },
+        ];
+        entry_value(&entries, b"b");
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0x3000c, location = Self)]
+    fun test_entry_value_key_after_the_last_entry_aborts() {
+        let entries = vector[GasEntry { key: string::utf8(b"a"), val: 1 }];
+        entry_value(&entries, b"b");
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0x3000c, location = Self)]
+    fun test_entry_value_in_an_empty_schedule_aborts() {
+        entry_value(&vector[], b"a");
     }
 }

@@ -23,7 +23,6 @@ module supra_framework::supra_governance {
     use supra_framework::governance_proposal::{Self, GovernanceProposal};
     use supra_framework::system_addresses;
     use supra_framework::supra_coin;
-    use supra_framework::consensus_config;
     use supra_framework::reconfiguration_with_dkg;
     use supra_framework::timestamp;
     use supra_framework::multisig_voting;

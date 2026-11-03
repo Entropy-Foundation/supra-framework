@@ -894,7 +894,6 @@ module supra_framework::genesis {
         consensus_config: vector<u8>,
         execution_config: vector<u8>,
         supra_config: vector<u8>,
-        evm_genesis_config: vector<u8>,
         epoch_interval_microsecs: u64,
         minimum_stake: u64,
         maximum_stake: u64,

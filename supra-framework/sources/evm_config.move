@@ -346,11 +346,11 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
+    #[expected_failure(abort_code = 0x60004, location = supra_framework::evm_config)]
     /// Failure test: get_contract_value aborts when the requested key is absent.
     ///
     /// The expected abort code is error::not_found(EKEY_NOT_FOUND)
     /// = (NOT_FOUND_CATEGORY=6 << 16) | EKEY_NOT_FOUND=4 = 0x60004.
-    #[expected_failure(abort_code = 0x60004, location = supra_framework::evm_config)]
     fun test_get_contract_value_key_not_found(supra_framework: signer) acquires EvmContractsDetails {
         move_to(&supra_framework, EvmContractsDetails {
             details: simple_map::new_from(
@@ -362,6 +362,7 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
+    #[expected_failure(abort_code = 0x10003, location = supra_framework::evm_config)]
     /// Failure test: upsert_evm_contract_details_for_next_epoch aborts when any
     /// address in the values vector is not a valid EVM address.
     ///
@@ -371,9 +372,8 @@ module supra_framework::evm_config {
     /// must trigger EINVALID_EVM_ADDRESS regardless of position in the vector.
     /// The expected abort code is error::invalid_argument(EINVALID_EVM_ADDRESS)
     /// = (INVALID_ARGUMENT_CATEGORY=1 << 16) | EINVALID_EVM_ADDRESS=3 = 0x10003.
-    #[expected_failure(abort_code = 0x10003, location = supra_framework::evm_config)]
     fun test_upsert_evm_contract_details_mixed_invalid_address(supra_framework: signer) acquires EvmContractsDetails {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 2);
         let keys = vector[
@@ -393,7 +393,7 @@ module supra_framework::evm_config {
     fun test_upsert_contract_details_buffers_when_unpublished(
         supra_framework: signer
     ) acquires EvmContractsDetails {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 2);
         upsert_evm_contract_details_for_next_epoch(
@@ -410,7 +410,7 @@ module supra_framework::evm_config {
     fun test_on_new_epoch_publishes_pending_contracts_details(
         supra_framework: signer
     ) acquires EvmContractsDetails, EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 2);
         upsert_evm_contract_details_for_next_epoch(
@@ -432,7 +432,7 @@ module supra_framework::evm_config {
     fun test_on_new_epoch_without_buffered_config_is_a_no_op(
         supra_framework: signer
     ) acquires EvmContractsDetails, EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         initialize_spec(&supra_framework, 2);
         initialize_contracts_details(
             &supra_framework,
@@ -446,12 +446,12 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
+    #[expected_failure(abort_code = 0x30009, location = supra_framework::gas_schedule)]
     /// Publishing contract details is refused while the gas schedule is below the version that
     /// carries the `supra.evm.*` entries: gas_schedule's
     /// error::invalid_state(ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD) = 0x30009.
-    #[expected_failure(abort_code = 0x30009, location = supra_framework::gas_schedule)]
     fun test_initialize_contracts_details_below_the_supra_evm_gas_feature_version(supra_framework: signer) {
-        gas_schedule::initialize_for_test(&supra_framework, 25);
+        gas_schedule::initialize_for_test(&supra_framework, 26);
         initialize_contracts_details(
             &supra_framework,
             vector[std::string::utf8(b"usdc_contract")],
@@ -460,13 +460,13 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// The same gate on the governance path.
     #[expected_failure(abort_code = 0x30009, location = supra_framework::gas_schedule)]
+    /// The same gate on the governance path.
     fun test_upsert_contract_details_below_the_supra_evm_gas_feature_version(
         supra_framework: signer
     ) acquires EvmContractsDetails {
         config_buffer::initialize(&supra_framework);
-        gas_schedule::initialize_for_test(&supra_framework, 25);
+        gas_schedule::initialize_for_test(&supra_framework, 26);
         upsert_evm_contract_details_for_next_epoch(
             &supra_framework,
             vector[std::string::utf8(b"usdc_contract")],
@@ -479,7 +479,7 @@ module supra_framework::evm_config {
     #[test(supra_framework = @supra_framework)]
     /// Genesis publishes the spec, and the view serves it.
     fun test_initialize_spec_publishes_it(supra_framework: signer) acquires EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         assert!(!evm_spec_published_or_pending(), 0);
         initialize_spec(&supra_framework, 1);
         assert!(current_spec() == 1, 1);
@@ -487,36 +487,36 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// error::invalid_argument(EZERO_EVM_SPEC) = 0x1000a.
     #[expected_failure(abort_code = 0x1000a, location = supra_framework::evm_config)]
+    /// error::invalid_argument(EZERO_EVM_SPEC) = 0x1000a.
     fun test_initialize_spec_refuses_zero(supra_framework: signer) {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         initialize_spec(&supra_framework, 0);
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// error::invalid_state(ERESOURCE_ALREADY_EXISTS) = 0x30006.
     #[expected_failure(abort_code = 0x30006, location = supra_framework::evm_config)]
+    /// error::invalid_state(ERESOURCE_ALREADY_EXISTS) = 0x30006.
     fun test_initialize_spec_twice_is_refused(supra_framework: signer) {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         initialize_spec(&supra_framework, 1);
         initialize_spec(&supra_framework, 2);
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// gas_schedule's error::invalid_state(ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD) = 0x30009.
     #[expected_failure(abort_code = 0x30009, location = supra_framework::gas_schedule)]
+    /// gas_schedule's error::invalid_state(ESUPRA_EVM_GAS_FEATURE_VERSION_TOO_OLD) = 0x30009.
     fun test_initialize_spec_below_the_supra_evm_gas_feature_version(supra_framework: signer) {
-        gas_schedule::initialize_for_test(&supra_framework, 25);
+        gas_schedule::initialize_for_test(&supra_framework, 26);
         initialize_spec(&supra_framework, 1);
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// The same gate on the governance path.
     #[expected_failure(abort_code = 0x30009, location = supra_framework::gas_schedule)]
+    /// The same gate on the governance path.
     fun test_set_spec_below_the_supra_evm_gas_feature_version(supra_framework: signer) acquires EvmSpec {
         config_buffer::initialize(&supra_framework);
-        gas_schedule::initialize_for_test(&supra_framework, 25);
+        gas_schedule::initialize_for_test(&supra_framework, 26);
         set_spec_for_next_epoch(&supra_framework, 1);
     }
 
@@ -525,7 +525,7 @@ module supra_framework::evm_config {
     fun test_set_spec_upgrade_applies_at_the_next_epoch(
         supra_framework: signer
     ) acquires EvmContractsDetails, EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 1);
 
@@ -538,31 +538,31 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
+    #[expected_failure(abort_code = 0x1000b, location = supra_framework::evm_config)]
     /// Setting the published spec again is refused: error::invalid_argument(EEVM_SPEC_DOWNGRADE)
     /// = 0x1000b.
-    #[expected_failure(abort_code = 0x1000b, location = supra_framework::evm_config)]
     fun test_set_spec_equal_is_refused(supra_framework: signer) acquires EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 2);
         set_spec_for_next_epoch(&supra_framework, 2);
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// A spec below the published one is refused.
     #[expected_failure(abort_code = 0x1000b, location = supra_framework::evm_config)]
+    /// A spec below the published one is refused.
     fun test_set_spec_downgrade_is_refused(supra_framework: signer) acquires EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         initialize_spec(&supra_framework, 2);
         set_spec_for_next_epoch(&supra_framework, 1);
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// Zero is refused on the governance path as well.
     #[expected_failure(abort_code = 0x1000a, location = supra_framework::evm_config)]
+    /// Zero is refused on the governance path as well.
     fun test_set_spec_zero_is_refused(supra_framework: signer) acquires EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         set_spec_for_next_epoch(&supra_framework, 0);
     }
@@ -573,7 +573,7 @@ module supra_framework::evm_config {
     fun test_set_spec_buffers_a_first_value_and_a_later_call_wins(
         supra_framework: signer
     ) acquires EvmContractsDetails, EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
 
         set_spec_for_next_epoch(&supra_framework, 2);
@@ -586,18 +586,18 @@ module supra_framework::evm_config {
     }
 
     #[test]
-    /// error::not_found(EKEY_NOT_FOUND) = 0x60004.
     #[expected_failure(abort_code = 0x60004, location = supra_framework::evm_config)]
+    /// error::not_found(EKEY_NOT_FOUND) = 0x60004.
     fun test_current_spec_without_one_aborts() acquires EvmSpec {
         current_spec();
     }
 
     #[test(supra_framework = @supra_framework)]
+    #[expected_failure(abort_code = 0x3000c, location = supra_framework::evm_config)]
     /// Contract details are refused at genesis without a spec:
     /// error::invalid_state(EMISSING_EVM_SPEC) = 0x3000c.
-    #[expected_failure(abort_code = 0x3000c, location = supra_framework::evm_config)]
     fun test_initialize_contracts_details_without_a_spec_is_refused(supra_framework: signer) {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         initialize_contracts_details(
             &supra_framework,
             vector[std::string::utf8(b"usdc_contract")],
@@ -606,12 +606,12 @@ module supra_framework::evm_config {
     }
 
     #[test(supra_framework = @supra_framework)]
-    /// And through governance.
     #[expected_failure(abort_code = 0x3000c, location = supra_framework::evm_config)]
+    /// And through governance.
     fun test_upsert_contract_details_without_a_spec_is_refused(
         supra_framework: signer
     ) acquires EvmContractsDetails {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         upsert_evm_contract_details_for_next_epoch(
             &supra_framework,
@@ -626,7 +626,7 @@ module supra_framework::evm_config {
     fun test_upsert_contract_details_with_a_pending_spec_is_accepted(
         supra_framework: signer
     ) acquires EvmContractsDetails, EvmSpec {
-        gas_schedule::initialize_for_test(&supra_framework, 26);
+        gas_schedule::initialize_for_test(&supra_framework, 27);
         config_buffer::initialize(&supra_framework);
         set_spec_for_next_epoch(&supra_framework, 2);
         upsert_evm_contract_details_for_next_epoch(

@@ -5,18 +5,19 @@ module supra_framework::dkg_config {
     use std::error;
     use std::vector;
     use supra_framework::config_buffer;
-    use supra_framework::features;
     use supra_framework::system_addresses;
     use supra_framework::validator_public_keys::{
         CertificateThresholdType,
         bcft_quorum_certificate_type,
         bcft_validity_certificate_type,
         clan_majority_certificate_type,
-        quorum_certificate_type,
-        validity_certificate_type
+        quorum_certificate_type
     };
     #[test_only]
-    use supra_framework::validator_public_keys::unanimous_certificate_type;
+    use supra_framework::validator_public_keys::{
+        unanimous_certificate_type,
+        validity_certificate_type
+    };
 
     friend supra_framework::genesis;
     friend supra_framework::reconfiguration_with_dkg;

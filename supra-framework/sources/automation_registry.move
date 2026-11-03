@@ -1,4 +1,4 @@
-/// Copywrite (c) -- 2025 Supra
+/// Copyright (c) -- 2025 Supra
 /// Supra Automation Registry
 ///
 /// This contract is part of the Supra Framework and is designed to manage automated task entries
@@ -6,6 +6,7 @@ module supra_framework::automation_registry {
 
     use std::bcs;
     use std::features;
+    use std::option;
     use std::signer;
     use std::string::String;
     use std::vector;
@@ -26,13 +27,12 @@ module supra_framework::automation_registry {
     use supra_framework::config_buffer;
     use supra_framework::create_signer::create_signer;
     use supra_framework::event;
+    use supra_framework::gas_schedule;
     use supra_framework::supra_coin::SupraCoin;
     use supra_framework::system_addresses;
     use supra_framework::timestamp;
 
     use supra_std::vector_utils::sort_vector_u64;
-    #[test_only]
-    use std::option;
 
     friend supra_framework::block;
     friend supra_framework::genesis;
@@ -142,6 +142,18 @@ module supra_framework::automation_registry {
     const EDISABLED_AUTOMATION_V2_1_FEATURE: u64 = 49;
     /// Task owner is not eligible to receive supra.
     const EOWNER_NOT_ELIGIBLE_TO_RECEIVE_SUPRA: u64 = 50;
+    /// The task's `max_gas_amount` is above `txn.maximum_number_of_gas_units` of the gas schedule
+    /// in force, so the VM would refuse every transaction built for it.
+    const EMAX_GAS_AMOUNT_ABOVE_CHAIN_CAP: u64 = 51;
+    /// The user task's `gas_price_cap` is below `txn.min_price_per_gas_unit` of the gas schedule in
+    /// force, so no transaction would ever be built for it.
+    const EGAS_PRICE_CAP_BELOW_MIN_PRICE: u64 = 52;
+    /// The removal kind of a runtime cancellation is none of `REMOVAL_KIND_ERROR`,
+    /// `REMOVAL_KIND_CONFIG_UPDATE` and `REMOVAL_KIND_PRE_EXECUTION_LIMIT`.
+    const EINVALID_TASK_REMOVAL_KIND: u64 = 53;
+    /// A user task's priority is its task index, which the registry assigns: a user task
+    /// registration whose `aux_data` carries a priority is refused.
+    const EUSER_TASK_PRIORITY_NOT_SUPPORTED: u64 = 54;
 
     /// The length of the transaction hash.
     const TXN_HASH_LENGTH: u64 = 32;
@@ -157,6 +169,23 @@ module supra_framework::automation_registry {
     /// 100 Percentage
     const MAX_PERCENTAGE: u8 = 100;
     const REFUND_FRACTION: u64 = 2;
+    /// Divisor of the refundable amounts when a task is removed through no fault of its owner:
+    /// they are refunded whole.
+    const FULL_REFUND_FRACTION: u64 = 1;
+
+    /// `details` of a `TaskRemovedByConfigUpdate` emitted by the cycle transition.
+    const TRANSITION_REMOVAL_DETAILS: vector<u8> = b"removed at the cycle transition, before charging the task for the new cycle";
+
+    /// Removal kinds of a runtime cancellation (`cancel_invalid_task`), matching the VM's
+    /// `AutomationTaskRemovalKind`. The kind decides the refund.
+    /// The task failed for a reason of its own: the `stop_tasks` refund applies.
+    const REMOVAL_KIND_ERROR: u8 = 0;
+    /// A gas-schedule update ruled the task out: the owner is refunded in full.
+    const REMOVAL_KIND_CONFIG_UPDATE: u8 = 1;
+    /// The VM refused the task's transaction before its entry function ran, for a limit of the
+    /// gas schedule or of the VM: the `stop_tasks` refund applies, since such a limit may also
+    /// follow from the task's own values or from an upgrade of the module it calls.
+    const REMOVAL_KIND_PRE_EXECUTION_LIMIT: u8 = 2;
 
     /// Constants describing task state.
     const PENDING: u8 = 0;
@@ -491,11 +520,15 @@ module supra_framework::automation_registry {
     }
 
     public fun is_of_type(task: &AutomationTaskMetaData, type: u8): bool {
+        task_type(task) == type
+    }
+
+    /// The type of `task`, `UST` or `GST`, as recorded in its aux data.
+    fun task_type(task: &AutomationTaskMetaData): u8 {
         assert!(vector::length(&task.aux_data) == SUPPORTED_AUX_DATA_COUNT_MAX, EINVALID_AUX_DATA_LENGTH);
         let type_data = vector::borrow(&task.aux_data, TYPE_AUX_DATA_INDEX);
         assert!(vector::length(type_data) == 1, EINVALID_TASK_TYPE_LENGTH);
-        let type_value = vector::borrow(type_data, 0);
-        *type_value == type
+        *vector::borrow(type_data, 0)
     }
 
     #[event]
@@ -655,6 +688,72 @@ module supra_framework::automation_registry {
         owner: address,
         registration_hash: vector<u8>,
         diagnostic_message: std::string::String,
+    }
+
+    #[event]
+    /// Emitted when a task is removed because the gas schedule in force rules out its
+    /// transaction: its `max_gas_amount` is above `txn.maximum_number_of_gas_units`, or, for a user
+    /// task, its `gas_price_cap` is below `txn.min_price_per_gas_unit`.
+    ///
+    /// The task did nothing wrong, so a user task's owner is refunded in full: the fee for the
+    /// rest of the current cycle and the whole deposit. A system task pays no fees and is
+    /// refunded nothing. Emitted both by a runtime cancellation of kind
+    /// `REMOVAL_KIND_CONFIG_UPDATE` and by the cycle transition, which removes such a task before
+    /// charging it for the new cycle and so refunds only its deposit.
+    ///
+    /// The refunds are reported by the events emitted with it: for a runtime cancellation,
+    /// `TasksStoppedV2`, which also carries the registration hash; at the cycle transition,
+    /// `TaskDepositFeeRefund` for a user task's deposit, and nothing for a system task, which is
+    /// refunded nothing. `task_index` identifies the task in every case.
+    struct TaskRemovedByConfigUpdate has drop, store {
+        task_index: u64,
+        owner: address,
+        task_type: u8,
+        /// The gas schedule key the task violates.
+        parameter: std::string::String,
+        /// The task's value the key bounds: `max_gas_amount` or `gas_price_cap`.
+        task_value: u64,
+        /// The key's value in the gas schedule in force.
+        limit: u64,
+        /// The description of the removal: the runtime's for a runtime cancellation, a fixed one
+        /// for a removal at the cycle transition.
+        details: std::string::String,
+    }
+
+    #[event]
+    /// Emitted when the runtime removes a task whose transaction the VM refused before its entry
+    /// function ran, for a limit of the gas schedule or of the VM: the transaction size, the
+    /// intrinsic gas, the dependency count or size, the type size, or the minimum gas of a
+    /// `#[randomness]` entry function. Emitted by a runtime cancellation of kind
+    /// `REMOVAL_KIND_PRE_EXECUTION_LIMIT`. While the registry enforces the gas schedule's bounds,
+    /// a task above the gas-unit bound is removed by kind `REMOVAL_KIND_CONFIG_UPDATE` instead,
+    /// with `TaskRemovedByConfigUpdate`.
+    ///
+    /// A user task's owner is refunded as on a `stop_tasks` call; a system task pays no fees and
+    /// is refunded nothing. The refunds are reported by `TasksStoppedV2`, emitted with it, which
+    /// also carries the registration hash.
+    struct TaskRemovedByPreExecutionLimit has drop, store {
+        task_index: u64,
+        owner: address,
+        task_type: u8,
+        /// The runtime's description of the limit, naming the status the VM reported.
+        details: std::string::String,
+    }
+
+    /// The per-transaction gas bounds of the gas schedule in force, read once by a caller that
+    /// checks several tasks.
+    struct TxnGasBounds has copy, drop {
+        max_gas_units: u64,
+        min_gas_price: u64,
+    }
+
+    /// A gas schedule bound that a task violates.
+    struct GasConfigViolation has drop {
+        parameter: vector<u8>,
+        task_value: u64,
+        limit: u64,
+        /// The code registration aborts with for this bound.
+        registration_abort_code: u64,
     }
 
     #[event]
@@ -1319,9 +1418,16 @@ module supra_framework::automation_registry {
     /// reused by the VM-only `cancel_invalid_task` without requiring a signer from the owner.
     /// Callers are responsible for ensuring `owner` is the legitimate task owner before calling;
     /// the per-task ownership assert inside this function provides a defence-in-depth check.
+    ///
+    /// `refund_divisor` divides the fee for the rest of the current cycle, and the deposit of a task
+    /// still pending, before they are refunded; an active task's deposit is refunded whole either
+    /// way. `REFUND_FRACTION` is the `stop_tasks` policy, used whenever the owner or the task is
+    /// the cause; `FULL_REFUND_FRACTION` refunds both whole, used when the task is removed through
+    /// no fault of its owner. The refunds are reported by `TasksStoppedV2`.
     fun stop_tasks_internal(
         owner: address,
-        task_indexes: vector<u64>
+        task_indexes: vector<u64>,
+        refund_divisor: u64,
     ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
         assert!(features::supra_native_automation_enabled(), EDISABLED_AUTOMATION_FEATURE);
         let cycle_info = borrow_global<AutomationCycleDetails>(@supra_framework);
@@ -1404,10 +1510,13 @@ module supra_framework::automation_registry {
                         current_time,
                         automation_fee_per_sec
                     );
-                    // Refund full deposit and the half of the remaining run-time fee when task is active or cancelled stage
-                    (task_fee_for_current_cycle, task_fee_for_residual_time / REFUND_FRACTION, task.locked_fee_for_next_epoch)
+                    // Refund the full deposit and the remaining run-time fee divided by `refund_divisor`
+                    // (half under the `stop_tasks` policy) when the task is in active or cancelled stage.
+                    // The residual window is at most the charged window, so the residual fee never
+                    // exceeds the cycle fee, which the assert below relies on with a divisor of 1.
+                    (task_fee_for_current_cycle, task_fee_for_residual_time / refund_divisor, task.locked_fee_for_next_epoch)
                 } else {
-                    (0, 0, (task.locked_fee_for_next_epoch / REFUND_FRACTION))
+                    (0, 0, (task.locked_fee_for_next_epoch / refund_divisor))
                 };
                 let result = safe_unlock_locked_deposit(
                     refund_bookkeeping,
@@ -1459,7 +1568,7 @@ module supra_framework::automation_registry {
         owner_signer: &signer,
         task_indexes: vector<u64>
     ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
-        stop_tasks_internal(signer::address_of(owner_signer), task_indexes)
+        stop_tasks_internal(signer::address_of(owner_signer), task_indexes, REFUND_FRACTION);
     }
 
     /// Cancels a single automation task that the runtime has determined to be invalid.
@@ -1482,13 +1591,55 @@ module supra_framework::automation_registry {
     /// Two events are emitted:
     ///   - `TasksStoppedV2`          (refund amounts, zero for system tasks)
     ///   - `TaskCancelledByRuntime`  (task identity + human-readable diagnostic message)
+    ///
+    /// `kind` says why the runtime removes the task, and so which refund applies:
+    ///   - `REMOVAL_KIND_ERROR`: the task failed for a reason of its own; handled as above;
+    ///   - `REMOVAL_KIND_CONFIG_UPDATE`: the gas schedule in force rules out the task's
+    ///     transaction; see `remove_task_invalidated_by_gas_config`;
+    ///   - `REMOVAL_KIND_PRE_EXECUTION_LIMIT`: the VM refused the task's transaction before its
+    ///     entry function ran, for a limit of the gas schedule or of the VM; the refund is the one
+    ///     above, and the events differ; see `remove_task_failed_pre_execution_limit`.
+    /// Any other value aborts with `EINVALID_TASK_REMOVAL_KIND`.
+    ///
+    /// A record of any kind fails, rather than doing nothing, so that the failure stays visible:
+    ///   - with `ECYCLE_TRANSITION_IN_PROGRESS` while the cycle is not started. The record was
+    ///     queued in a cycle that has since ended; the transition charges or drops the task as any
+    ///     other, and if the task still cannot run, the node queues a new record in the next cycle;
+    ///   - with `EAUTOMATION_TASK_NOT_FOUND` when the task no longer exists.
     fun cancel_invalid_task(
         vm: signer,
         task_index: u64,
+        kind: u8,
         diagnostic_message: std::string::String,
     ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
         // Guard: only the VM may trigger runtime cancellation.
         system_addresses::assert_vm(&vm);
+
+        // The kind is checked before the cycle state, so that an unknown kind is refused in every
+        // state.
+        assert!(
+            kind == REMOVAL_KIND_ERROR
+                || kind == REMOVAL_KIND_CONFIG_UPDATE
+                || kind == REMOVAL_KIND_PRE_EXECUTION_LIMIT,
+            EINVALID_TASK_REMOVAL_KIND
+        );
+        assert!(
+            borrow_global<AutomationCycleDetails>(@supra_framework).state == CYCLE_STARTED,
+            ECYCLE_TRANSITION_IN_PROGRESS
+        );
+        assert!(
+            enumerable_map::contains(&borrow_global<AutomationRegistryV2>(@supra_framework).main.tasks, task_index),
+            EAUTOMATION_TASK_NOT_FOUND
+        );
+
+        if (kind == REMOVAL_KIND_CONFIG_UPDATE) {
+            remove_task_invalidated_by_gas_config(task_index, diagnostic_message);
+            return
+        };
+        if (kind == REMOVAL_KIND_PRE_EXECUTION_LIMIT) {
+            remove_task_failed_pre_execution_limit(task_index, diagnostic_message);
+            return
+        };
 
         // Read owner address and registration hash before the mutable borrow inside
         // stop_tasks_internal. AutomationTaskMetaData has `copy` ability, so
@@ -1499,10 +1650,6 @@ module supra_framework::automation_registry {
         let is_system_task;
         {
             let automation_registry = borrow_global<AutomationRegistryV2>(@supra_framework);
-            assert!(
-                enumerable_map::contains(&automation_registry.main.tasks, task_index),
-                EAUTOMATION_TASK_NOT_FOUND
-            );
             let task = enumerable_map::get_value(&automation_registry.main.tasks, task_index);
             owner = task.owner;
             registration_hash = task.tx_hash;
@@ -1513,11 +1660,7 @@ module supra_framework::automation_registry {
 
         // Remove the task through the same path as the voluntary stop entry for its type.
         // Both paths emit TasksStoppedV2 with the per-task refund detail.
-        if (is_system_task) {
-            stop_system_tasks_internal(owner, vector[task_index]);
-        } else {
-            stop_tasks_internal(owner, vector[task_index]);
-        };
+        remove_task_for_runtime(owner, is_system_task, task_index, REFUND_FRACTION);
 
         // Emit the runtime-specific event so indexers/explorers can surface the diagnostic
         // message to the owner rather than showing only an unexplained stop.
@@ -1526,6 +1669,168 @@ module supra_framework::automation_registry {
             owner,
             registration_hash,
             diagnostic_message,
+        });
+    }
+
+    /// Removes a task that the gas schedule in force rules out, refunding a user task's owner in
+    /// full. Called by `cancel_invalid_task` for a record of kind `REMOVAL_KIND_CONFIG_UPDATE`.
+    ///
+    /// The node queues the record when an epoch's gas schedule rules out the task, and the record
+    /// runs in a later block. By then the schedule may admit the task again. The rule is therefore
+    /// checked again here, and the record does nothing, without an event, when:
+    ///   - the registry does not enforce the gas schedule's bounds or cannot read them
+    ///     (`enforced_txn_gas_bounds`): `SUPRA_AUTOMATION_V2_1` is disabled, which the VM also
+    ///     refuses such a record under, or the published schedule cannot be searched;
+    ///   - the task satisfies both bounds of the schedule in force.
+    /// Otherwise a user task is removed through `stop_tasks_internal` with the full refund, and a
+    /// system task through `stop_system_tasks_internal`, with nothing to refund. Either way
+    /// `TaskRemovedByConfigUpdate` is emitted, naming the bound the task violates.
+    fun remove_task_invalidated_by_gas_config(
+        task_index: u64,
+        details: std::string::String,
+    ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
+        // `cancel_invalid_task` has already refused a record while the cycle is not started, or for
+        // a task that no longer exists; the transition checks every task against the same rule
+        // before charging it (`drop_or_charge_task`).
+        let bounds = enforced_txn_gas_bounds();
+        if (option::is_none(&bounds)) {
+            return
+        };
+        // Only the fields the check and the event need, read in their own block so that no
+        // reference into the registry survives into the mutable borrow of the removal below.
+        let (owner, type, max_gas_amount, gas_price_cap) = {
+            let tasks = &borrow_global<AutomationRegistryV2>(@supra_framework).main.tasks;
+            let task = enumerable_map::get_value_ref(tasks, task_index);
+            (task.owner, task_type(task), task.max_gas_amount, task.gas_price_cap)
+        };
+        let violation = gas_config_violation(max_gas_amount, gas_price_cap, type, option::borrow(&bounds));
+        if (option::is_none(&violation)) {
+            return
+        };
+
+        remove_task_for_runtime(owner, type == GST, task_index, FULL_REFUND_FRACTION);
+        emit_task_removed_by_config_update(task_index, owner, type, option::destroy_some(violation), details);
+    }
+
+    /// Removes a task whose transaction the VM refused before its entry function ran, for a limit
+    /// of the gas schedule or of the VM, refunding a user task's owner as on a `stop_tasks` call.
+    /// Called by `cancel_invalid_task` for a record of kind `REMOVAL_KIND_PRE_EXECUTION_LIMIT`.
+    ///
+    /// The node queues the record when the VM discards the task's transaction with
+    /// `AUTOMATION_PRE_EXECUTION_LIMIT_REACHED`, and the record runs in a later block. The VM has
+    /// already decided the limit, and Move cannot evaluate it again, so the task is not re-checked.
+    /// A record while the cycle is not started, or for a task that no longer exists, has already
+    /// been refused by `cancel_invalid_task`.
+    /// Otherwise a user task is removed through `stop_tasks_internal` with the `stop_tasks`
+    /// refund, and a system task through `stop_system_tasks_internal`, with nothing to refund.
+    /// Either way `TaskRemovedByPreExecutionLimit` is emitted with the runtime's description.
+    fun remove_task_failed_pre_execution_limit(
+        task_index: u64,
+        details: std::string::String,
+    ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
+        // Read in its own block so that no reference into the registry survives into the
+        // mutable borrow of the removal below.
+        let (owner, type) = {
+            let tasks = &borrow_global<AutomationRegistryV2>(@supra_framework).main.tasks;
+            let task = enumerable_map::get_value_ref(tasks, task_index);
+            (task.owner, task_type(task))
+        };
+
+        remove_task_for_runtime(owner, type == GST, task_index, REFUND_FRACTION);
+        event::emit(TaskRemovedByPreExecutionLimit { task_index, owner, task_type: type, details });
+    }
+
+    /// Removes one task on behalf of the runtime, through the path of the voluntary stop entry for
+    /// its type: a system task through `stop_system_tasks_internal`, which refunds nothing, and a
+    /// user task through `stop_tasks_internal` with `refund_fraction` as the divisor of its refund:
+    /// `FULL_REFUND_FRACTION` for the full refund, `REFUND_FRACTION` for the `stop_tasks` refund.
+    /// Both emit `TasksStoppedV2`. Shared by every removal kind
+    /// of `cancel_invalid_task`, so that they differ only in their guards, refund and events.
+    fun remove_task_for_runtime(
+        owner: address,
+        is_system_task: bool,
+        task_index: u64,
+        refund_fraction: u64,
+    ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
+        if (is_system_task) {
+            stop_system_tasks_internal(owner, vector[task_index]);
+        } else {
+            stop_tasks_internal(owner, vector[task_index], refund_fraction);
+        };
+    }
+
+    /// The per-transaction gas bounds of the gas schedule in force, if the registry enforces them:
+    /// none while `SUPRA_AUTOMATION_V2_1` is disabled, under which tasks are not bounded by the gas
+    /// schedule, or while the published schedule cannot be searched (see
+    /// `gas_schedule::is_txn_gas_bounds_read_supported`).
+    ///
+    /// Used where an abort must be avoided: the cycle transition and runtime removal records. A
+    /// task is then neither removed nor refused for gas bounds the registry does not enforce or
+    /// cannot read. Registration does not use it: it must refuse a task, not admit it, when the
+    /// bounds apply and cannot be read (see `assert_valid_task_gas`).
+    fun enforced_txn_gas_bounds(): option::Option<TxnGasBounds> {
+        if (!features::supra_automation_v2_1_enabled()
+            || !gas_schedule::is_txn_gas_bounds_read_supported()) {
+            return option::none()
+        };
+        let (max_gas_units, min_gas_price) = gas_schedule::txn_gas_bounds();
+        option::some(TxnGasBounds { max_gas_units, min_gas_price })
+    }
+
+    /// The gas schedule bound a task of `task_type` with these figures violates, if any.
+    ///
+    /// A task is outside the gas schedule if its `max_gas_amount` is above
+    /// `txn.maximum_number_of_gas_units`, which the VM refuses as a transaction's gas limit, or if
+    /// it is a user task whose `gas_price_cap` is below `txn.min_price_per_gas_unit`, under which
+    /// no transaction is built for it. System tasks are registered with a `gas_price_cap` of 0 and
+    /// built without the price check, so only the gas cap applies to them. The gas cap is checked
+    /// first, so a task outside both bounds reports the cap.
+    ///
+    /// The single statement of the rule, applied at registration (`assert_valid_task_gas`), by a
+    /// runtime removal and at the cycle transition, so that they cannot disagree. The node's epoch
+    /// scan applies the same rule.
+    fun gas_config_violation(
+        max_gas_amount: u64,
+        gas_price_cap: u64,
+        task_type: u8,
+        bounds: &TxnGasBounds,
+    ): option::Option<GasConfigViolation> {
+        if (max_gas_amount > bounds.max_gas_units) {
+            return option::some(GasConfigViolation {
+                parameter: gas_schedule::txn_maximum_number_of_gas_units_key(),
+                task_value: max_gas_amount,
+                limit: bounds.max_gas_units,
+                registration_abort_code: EMAX_GAS_AMOUNT_ABOVE_CHAIN_CAP,
+            })
+        };
+        if (task_type == UST && gas_price_cap < bounds.min_gas_price) {
+            return option::some(GasConfigViolation {
+                parameter: gas_schedule::txn_min_price_per_gas_unit_key(),
+                task_value: gas_price_cap,
+                limit: bounds.min_gas_price,
+                registration_abort_code: EGAS_PRICE_CAP_BELOW_MIN_PRICE,
+            })
+        };
+        option::none()
+    }
+
+    /// Emits `TaskRemovedByConfigUpdate` for the task `task_index`, removed for `violation`.
+    fun emit_task_removed_by_config_update(
+        task_index: u64,
+        owner: address,
+        task_type: u8,
+        violation: GasConfigViolation,
+        details: std::string::String,
+    ) {
+        let GasConfigViolation { parameter, task_value, limit, registration_abort_code: _ } = violation;
+        event::emit(TaskRemovedByConfigUpdate {
+            task_index,
+            owner,
+            task_type,
+            parameter: std::string::utf8(parameter),
+            task_value,
+            limit,
+            details,
         });
     }
 
@@ -1909,6 +2214,38 @@ module supra_framework::automation_registry {
         // If in already SUSPENED state or in READY state then do nothing.
     }
 
+    /// Aborts unless a task's gas figures are valid for registration: `max_gas_amount` non-zero
+    /// (`EINVALID_MAX_GAS_AMOUNT`), a user task's `gas_price_cap` non-zero (`EINVALID_GAS_PRICE`),
+    /// and, while `SUPRA_AUTOMATION_V2_1` is enabled, both within the per-transaction gas bounds of
+    /// the gas schedule in force by the rule of `gas_config_violation`: else
+    /// `EMAX_GAS_AMOUNT_ABOVE_CHAIN_CAP` or `EGAS_PRICE_CAP_BELOW_MIN_PRICE`. A task outside these
+    /// bounds would be charged every cycle and never run.
+    ///
+    /// The bounds are checked only while `SUPRA_AUTOMATION_V2_1` is enabled. Every registration
+    /// path reaches `register` or `register_system_task`, including the transaction path, which
+    /// reaches them with the feature disabled, so the check tests the feature itself. With the
+    /// feature enabled it aborts in `gas_schedule::txn_gas_bounds` if the published schedule cannot
+    /// be read: refusing a registration is safe, while admitting an unbounded task is not.
+    fun assert_valid_task_gas(max_gas_amount: u64, gas_price_cap: u64, task_type: u8) {
+        if (task_type == UST) {
+            assert!(gas_price_cap > 0, EINVALID_GAS_PRICE);
+        };
+        assert!(max_gas_amount > 0, EINVALID_MAX_GAS_AMOUNT);
+        if (!features::supra_automation_v2_1_enabled()) {
+            return
+        };
+        let (max_gas_units, min_gas_price) = gas_schedule::txn_gas_bounds();
+        let violation = gas_config_violation(
+            max_gas_amount,
+            gas_price_cap,
+            task_type,
+            &TxnGasBounds { max_gas_units, min_gas_price }
+        );
+        if (option::is_some(&violation)) {
+            abort option::destroy_some(violation).registration_abort_code
+        };
+    }
+
     // Private Native VM referenced api
 
     /// Registers a new automation task entry.
@@ -1924,7 +2261,9 @@ module supra_framework::automation_registry {
     ) acquires AutomationRegistryV2, AutomationCycleDetails, ActiveAutomationRegistryConfigV2, AutomationRefundBookkeeping {
         // Guarding registration if feature is not enabled.
         assert!(features::supra_native_automation_enabled(), EDISABLED_AUTOMATION_FEATURE);
-        let has_no_priority = check_and_validate_aux_data(&aux_data, UST);
+        // Refuses a user task whose aux data carries a priority: its priority is its task index,
+        // assigned below.
+        check_and_validate_aux_data(&aux_data, UST);
 
         let automation_registry_config = borrow_global<ActiveAutomationRegistryConfigV2>(@supra_framework);
         let automation_cycle_info = borrow_global<AutomationCycleDetails>(@supra_framework);
@@ -1953,8 +2292,7 @@ module supra_framework::automation_registry {
             UST
         );
 
-        assert!(gas_price_cap > 0, EINVALID_GAS_PRICE);
-        assert!(max_gas_amount > 0, EINVALID_MAX_GAS_AMOUNT);
+        assert_valid_task_gas(max_gas_amount, gas_price_cap, UST);
         assert!(vector::length(&tx_hash) == TXN_HASH_LENGTH, EINVALID_TXN_HASH);
 
         let committed_gas = (automation_registry.gas_committed_for_next_epoch as u128) + (max_gas_amount as u128);
@@ -1976,10 +2314,8 @@ module supra_framework::automation_registry {
         automation_registry.gas_committed_for_next_epoch = committed_gas;
         let task_index = automation_registry.current_index;
 
-        if (has_no_priority) {
-            let priority = std::bcs::to_bytes(&task_index);
-            vector_utils::replace(&mut aux_data, PRIORITY_AUX_DATA_INDEX, priority);
-        };
+        let priority = std::bcs::to_bytes(&task_index);
+        vector_utils::replace(&mut aux_data, PRIORITY_AUX_DATA_INDEX, priority);
 
         let automation_task_metadata = AutomationTaskMetaData {
             task_index,
@@ -2021,14 +2357,23 @@ module supra_framework::automation_registry {
     /// Unlike the `AutomationRegistrationPayload` transaction path (which calls the private
     /// `register` via the VM and performs full payload validation before execution), this
     /// function does NOT validate that `payload_tx` encodes a well-formed entry function with
-    /// correct parameter types. If the payload is malformed, the task will fail silently at
-    /// execution time and the caller will have paid registration and deposit fees for nothing.
-    /// The caller is responsible for providing a valid BCS-encoded `EntryFunction` payload.
+    /// correct parameter types, or that the task's transaction fits the limits the VM applies
+    /// before running it. The caller is responsible for providing a valid BCS-encoded
+    /// `EntryFunction` payload. With `supra_automation_v2_1_enabled`, the VM discards without
+    /// charge an automated transaction it cannot run, and the runtime removes the task through
+    /// `cancel_invalid_task` with the `stop_tasks` refund: `TaskCancelledByRuntime` reports a
+    /// payload that cannot be executed, and `TaskRemovedByPreExecutionLimit` a limit the VM
+    /// applies before execution. The registration fee is not refunded.
     ///
     /// The required consenus hash of the transaciton registering the task is obtained from native
     /// layer.
     ///
     /// Requires both `supra_native_automation_enabled` and `supra_automation_v2_1_enabled`.
+    ///
+    /// The priority slot of `aux_data` must be empty: the registry assigns the task index as the
+    /// task's priority (see `EUSER_TASK_PRIORITY_NOT_SUPPORTED`).
+    ///
+    /// Returns the index of the registered task, so that a calling contract can later refer to it.
     public fun register_without_validation(
         owner_signer: &signer,
         payload_tx: vector<u8>,
@@ -2037,9 +2382,12 @@ module supra_framework::automation_registry {
         gas_price_cap: u64,
         automation_fee_cap_for_epoch: u64,
         aux_data: vector<vector<u8>>
-    ) acquires AutomationRegistryV2, AutomationCycleDetails, ActiveAutomationRegistryConfigV2, AutomationRefundBookkeeping {
+    ): u64 acquires AutomationRegistryV2, AutomationCycleDetails, ActiveAutomationRegistryConfigV2, AutomationRefundBookkeeping {
         assert!(features::supra_automation_v2_1_enabled(), EDISABLED_AUTOMATION_V2_1_FEATURE);
         let tx_hash = supra_framework::transaction_context::get_transaction_consensus_hash();
+        // `register` assigns the registry's current index to the task. Its signature is fixed by
+        // the VM, which calls it directly, so the index is read here rather than returned by it.
+        let task_index = borrow_global<AutomationRegistryV2>(@supra_framework).main.current_index;
         register(
             owner_signer,
             payload_tx,
@@ -2049,7 +2397,8 @@ module supra_framework::automation_registry {
             automation_fee_cap_for_epoch,
             tx_hash,
             aux_data,
-        )
+        );
+        task_index
     }
 
     /// Registers a new system automation task entry.
@@ -2092,7 +2441,9 @@ module supra_framework::automation_registry {
             GST
         );
 
-        assert!(max_gas_amount > 0, EINVALID_MAX_GAS_AMOUNT);
+        // System tasks are registered with a gas price cap of 0 and built without a gas price
+        // check, so only the gas amount is checked.
+        assert_valid_task_gas(max_gas_amount, 0, GST);
         assert!(vector::length(&tx_hash) == TXN_HASH_LENGTH, EINVALID_TXN_HASH);
 
         let committed_gas = (automation_registry.system_tasks_state.gas_committed_for_next_cycle as u128) + (max_gas_amount as u128);
@@ -2138,9 +2489,13 @@ module supra_framework::automation_registry {
     /// Unlike the `AutomationRegistrationPayload` transaction path (which calls the private
     /// `register_system_task` via the VM and performs full payload validation before execution), this
     /// function does NOT validate that `payload_tx` encodes a well-formed entry function with
-    /// correct parameter types. If the payload is malformed, the task will fail silently at
-    /// execution time and the caller will have paid registration and deposit fees for nothing.
-    /// The caller is responsible for providing a valid BCS-encoded `EntryFunction` payload.
+    /// correct parameter types, or that the task's transaction fits the limits the VM applies
+    /// before running it. The caller is responsible for providing a valid BCS-encoded
+    /// `EntryFunction` payload. With `supra_automation_v2_1_enabled`, the VM discards an automated
+    /// transaction it cannot run, and the runtime removes the task through `cancel_invalid_task`:
+    /// `TaskCancelledByRuntime` reports a payload that cannot be executed, and
+    /// `TaskRemovedByPreExecutionLimit` a limit the VM applies before execution. System tasks pay
+    /// no fees, so nothing is refunded.
     ///
     /// The required consenus hash of the transaciton registering the task is obtained from native
     /// layer.
@@ -2333,6 +2688,11 @@ module supra_framework::automation_registry {
         // Sort task indexes to charge automation fees in the tasks chronological order
         task_ids = sort_vector_u64(task_ids);
 
+        // The gas bounds every task is checked against before it is charged for the new cycle,
+        // read once for the batch. None when the registry does not enforce them or cannot read
+        // them (see `enforced_txn_gas_bounds`), so that the transition never aborts on them.
+        let gas_bounds = enforced_txn_gas_bounds();
+
         // Process each active task and calculate fee for the epoch for the tasks
         vector::for_each(task_ids, |task_index| {
             drop_or_charge_task(
@@ -2344,13 +2704,32 @@ module supra_framework::automation_registry {
                 &resource_signer,
                 current_time,
                 current_cycle_end_time,
-                intermediate_state
+                intermediate_state,
+                &gas_bounds,
             )
         });
     }
 
     /// Drops or charges the input task.
     /// If the task is already processed or missing from the registry then nothing is done.
+    ///
+    /// When `gas_bounds` is given, a task that is neither cancelled nor expired but is outside
+    /// them (see `gas_config_violation`) is dropped before it is charged for the new cycle: a user
+    /// task with its deposit refunded, a system task with nothing to refund. Its current-cycle fee
+    /// was spent on the cycle that has just ended, so there is no cycle fee to refund.
+    /// `TaskRemovedByConfigUpdate` is emitted for it.
+    ///
+    /// By design, the new cycle's fee per second is fixed once, when the cycle ends, from the
+    /// committed gas of every task expected to run in it (`gas_committed_for_next_epoch`), so that
+    /// every task charged in the transition pays the same rate. A task dropped here for the gas
+    /// schedule still counts towards that rate for the new cycle, unlike a task that has finished.
+    /// Unlike the fee-cap and balance drops, it could be excluded, since the bounds and the task's
+    /// figures do not depend on the rate; it is not, because that would mean reading and checking
+    /// every task against the bounds before the rate is computed, in addition to the pass that
+    /// charges them. A task reaches the transition outside the bounds only if the runtime's removal
+    /// record (`remove_task_invalidated_by_gas_config`) has not run before the cycle ends, so the
+    /// higher rate lasts one cycle: the task is not counted in the committed gas carried into the
+    /// following cycle.
     fun drop_or_charge_task(
         task_index: u64,
         automation_registry: &mut AutomationRegistryV2,
@@ -2361,6 +2740,7 @@ module supra_framework::automation_registry {
         current_time: u64,
         current_cycle_end_time: u64,
         intermediate_state: &mut IntermediateStateOfCycleChange,
+        gas_bounds: &option::Option<TxnGasBounds>,
     )
     {
         if (!enumerable_map::contains(&automation_registry.main.tasks, task_index)) {
@@ -2368,14 +2748,34 @@ module supra_framework::automation_registry {
         };
         mark_task_processed(transition_state, task_index);
         let task_meta = enumerable_map::get_value_mut(&mut automation_registry.main.tasks, task_index);
-        if (task_meta.state == CANCELLED || task_meta.expiry_time <= current_time) {
-            if (is_of_type(task_meta, UST)) {
+        let type = task_type(task_meta);
+        // A cancelled or expired task is dropped; so is one the gas schedule rules out, which is
+        // then also reported.
+        let is_finished = task_meta.state == CANCELLED || task_meta.expiry_time <= current_time;
+        let violation = if (is_finished || option::is_none(gas_bounds)) {
+            option::none()
+        } else {
+            gas_config_violation(task_meta.max_gas_amount, task_meta.gas_price_cap, type, option::borrow(gas_bounds))
+        };
+        if (is_finished || option::is_some(&violation)) {
+            let owner = task_meta.owner;
+            if (type == UST) {
                 refund_deposit_and_drop(task_index, automation_registry, refund_bookkeeping, resource_signer, &mut intermediate_state.removed_tasks);
             } else {
                 drop_system_task(task_index, automation_registry, &mut intermediate_state.removed_tasks)
             };
+            if (option::is_some(&violation)) {
+                emit_task_removed_by_config_update(
+                    task_index,
+                    owner,
+                    type,
+                    option::destroy_some(violation),
+                    std::string::utf8(TRANSITION_REMOVAL_DETAILS)
+                );
+            };
             return
-        } else if (is_of_type(task_meta, GST)) {
+        };
+        if (type == GST) {
             // Governance submitted tasks are not charged
             intermediate_state.sys_gas_committed_for_next_cycle = intermediate_state.sys_gas_committed_for_next_cycle + task_meta.max_gas_amount;
             task_meta.state = ACTIVE;
@@ -3295,8 +3695,11 @@ module supra_framework::automation_registry {
         );
     }
 
-    /// Validates auxiliary data , by checking task type and priority if any specified.
-    /// Returns true if priority is not specify, false if specified.
+    /// Validates auxiliary data, by checking the task type and the priority if one is specified.
+    /// A user task must not specify a priority, its priority is its task index, and aborts with
+    /// `EUSER_TASK_PRIORITY_NOT_SUPPORTED` if it does. A system task may specify one, which must
+    /// decode as a `u64`.
+    /// Returns true if no priority is specified, false if one is.
     fun check_and_validate_aux_data(aux_data: &vector<vector<u8>>, task_type: u8) : bool {
         assert!(vector::length(aux_data) == SUPPORTED_AUX_DATA_COUNT_MAX, EINVALID_AUX_DATA_LENGTH);
 
@@ -3309,6 +3712,7 @@ module supra_framework::automation_registry {
         // Check priority existence
         let maybe_task_priority = vector::borrow(aux_data, PRIORITY_AUX_DATA_INDEX);
         let has_no_priority = vector::is_empty(maybe_task_priority);
+        assert!(task_type != UST || has_no_priority, EUSER_TASK_PRIORITY_NOT_SUPPORTED);
         if (!has_no_priority) {
             // If there is a value specified validate that it can be converted to u64 successfully.
             // This will allow to avoid invalid task registration
@@ -3652,7 +4056,57 @@ module supra_framework::automation_registry {
         task_index: u64,
         diagnostic_message: std::string::String,
     ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
-        cancel_invalid_task(create_signer(@vm_reserved), task_index, diagnostic_message);
+        cancel_invalid_task(create_signer(@vm_reserved), task_index, REMOVAL_KIND_ERROR, diagnostic_message);
+    }
+
+    #[test_only]
+    /// A `TaskRemovedByConfigUpdate` with the given fields, for tests comparing it with an emitted
+    /// one.
+    public(friend) fun task_removed_by_config_update_for_tests(
+        task_index: u64,
+        owner: address,
+        task_type: u8,
+        parameter: vector<u8>,
+        task_value: u64,
+        limit: u64,
+        details: std::string::String,
+    ): TaskRemovedByConfigUpdate {
+        TaskRemovedByConfigUpdate {
+            task_index,
+            owner,
+            task_type,
+            parameter: std::string::utf8(parameter),
+            task_value,
+            limit,
+            details,
+        }
+    }
+
+    #[test_only]
+    /// A `TaskRemovedByPreExecutionLimit` with the given fields, for tests comparing it with an
+    /// emitted one.
+    public(friend) fun task_removed_by_pre_execution_limit_for_tests(
+        task_index: u64,
+        owner: address,
+        task_type: u8,
+        details: std::string::String,
+    ): TaskRemovedByPreExecutionLimit {
+        TaskRemovedByPreExecutionLimit { task_index, owner, task_type, details }
+    }
+
+    #[test_only]
+    public(friend) fun transition_removal_details_for_tests(): std::string::String {
+        std::string::utf8(TRANSITION_REMOVAL_DETAILS)
+    }
+
+    #[test_only]
+    /// Calls the VM-only `cancel_invalid_task` with the VM signer and the given removal `kind`.
+    public(friend) fun cancel_invalid_task_with_kind_for_tests(
+        task_index: u64,
+        kind: u8,
+        diagnostic_message: std::string::String,
+    ) acquires AutomationRegistryV2, ActiveAutomationRegistryConfigV2, AutomationCycleDetails, AutomationRefundBookkeeping {
+        cancel_invalid_task(create_signer(@vm_reserved), task_index, kind, diagnostic_message);
     }
 
     #[test_only]
@@ -3927,6 +4381,14 @@ module supra_framework::automation_registry {
     #[test]
     #[expected_failure(abort_code = 65537, location = from_bcs)]
     fun check_invalid_priority_aux_data(
+    ) {
+        let aux_data = vector[vector[GST], vector[4, 5]];
+        check_and_validate_aux_data(&aux_data, GST);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = EUSER_TASK_PRIORITY_NOT_SUPPORTED, location = Self)]
+    fun check_user_task_priority_aux_data_is_refused_before_decoding(
     ) {
         let aux_data = vector[vector[UST], vector[4, 5]];
         check_and_validate_aux_data(&aux_data, UST);

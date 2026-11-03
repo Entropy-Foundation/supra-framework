@@ -1,7 +1,9 @@
 module aptos_std::type_info {
     use std::bcs;
     use std::features;
-    use std::string::{Self, String};
+    use std::string::String;
+    #[test_only]
+    use std::string;
     use std::vector;
 
     //

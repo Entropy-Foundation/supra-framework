@@ -1,29 +1,31 @@
 {
   "network": "devnet",
   "chain_id": 50,
-  "genesis_hash": "0x4c57a68fbe996694b32aadb15386651c0411f59c91bc310140197711c2b2345d",
-  "retired_genesis_hashes": [],
-  "registry_sha256": "04b73954719ed39e923a6a6a6271d901a8363415e07292ad0434a20eb14b624b",
+  "genesis_hash": "0x97e952eccd56ca6ceac044a36f124786666b17c420b6daad80e12cc3a73c0db2",
+  "retired_genesis_hashes": [
+    "0x4c57a68fbe996694b32aadb15386651c0411f59c91bc310140197711c2b2345d"
+  ],
+  "registry_sha256": "ff158a8ed29c2f6771b467b0e59ccc9391c54606c17c4e009fd57e8f344789ee",
   "packages": [
     {
       "name": "MoveStdlib",
       "upgrade_number": "0",
-      "source_digest": "77DC26B6998BEF6E1BFED909C337D4A7DCE29A037314BB19301D728B7ADD754C"
+      "source_digest": "95B1CD0FA1D933CB580E73139FE1A10861E326B9195AD566B64D27355E72271E"
     },
     {
       "name": "AptosStdlib",
       "upgrade_number": "0",
-      "source_digest": "D9F8765E42CEE54B926A0DF6251BF587F9938BA45BC10F93A257EE61DDA14DCB"
+      "source_digest": "16F28C164BC5EA4CBADCD533D863E2884A8086343BDE0EA860388CB7A2E1237E"
     },
     {
       "name": "SupraStdlib",
       "upgrade_number": "0",
-      "source_digest": "321CFF2EF5DF8B696C9757536A0EE101222511274BFAAC7B384B6FD5B4E89A2B"
+      "source_digest": "853B0130CC9EF1438363F696053AB94A4FAE26F728021F6A1F2EF118DDA61AE3"
     },
     {
       "name": "SupraFramework",
       "upgrade_number": "0",
-      "source_digest": "259B5E4D46F1F0548C68A9E77053B2CC2A007A42656E584976A6C248E4DA4D5F"
+      "source_digest": "B9961F5065E5D1386F236F9A09E640A30020EAB396300AB83B1EED14CA69E14C"
     }
   ]
 }

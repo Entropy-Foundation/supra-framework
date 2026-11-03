@@ -5,11 +5,12 @@ module supra_framework::coin {
     use std::option::{Self, Option};
     use std::signer;
     use std::string::{Self, String};
+    use std::vector;
     use aptos_std::table::{Self, Table};
 
     use supra_framework::account;
     use supra_framework::aggregator_factory;
-    use supra_framework::aggregator::{Self, Aggregator};
+    use supra_framework::aggregator::Aggregator;
     use supra_framework::event::{Self, EventHandle};
     use supra_framework::guid;
     use supra_framework::optional_aggregator::{Self, OptionalAggregator};
@@ -63,9 +64,6 @@ module supra_framework::coin {
     /// Symbol of the coin is too long
     const ECOIN_SYMBOL_TOO_LONG: u64 = 13;
 
-    /// The value of aggregatable coin used for transaction fees redistribution does not fit in u64.
-    const EAGGREGATABLE_COIN_VALUE_TOO_LARGE: u64 = 14;
-
     /// Error regarding paired coin type of the fungible asset metadata.
     const EPAIRED_COIN: u64 = 15;
 
@@ -112,6 +110,8 @@ module supra_framework::coin {
     const EPAIRED_SUPPLY_CEILING_EXISTS: u64 = 29;
     /// Only SUPRA carries a supply ceiling on its paired fungible asset.
     const EPAIRED_SUPPLY_CEILING_UNSUPPORTED: u64 = 30;
+    /// `migrate_coin_store_to_fungible_store` supports only SUPRA.
+    const EMIGRATION_UNSUPPORTED_COIN_TYPE: u64 = 31;
 
     //
     // Constants
@@ -128,9 +128,9 @@ module supra_framework::coin {
         value: u64,
     }
 
-    /// Represents a coin with aggregator as its value. This allows to update
-    /// the coin in every transaction avoiding read-modify-write conflicts. Only
-    /// used for gas fees distribution by Supra Framework (0x1).
+    /// Represents a coin with aggregator as its value. Its only use is the field of
+    /// `transaction_fee::CollectedFeesPerBlock`, which is retired
+    /// (Entropy-Foundation/smr-moonshot#4786). A published struct cannot be removed.
     struct AggregatableCoin<phantom CoinType> has store {
         /// Amount of aggregatable coin this address has.
         value: Aggregator,
@@ -249,9 +249,9 @@ module supra_framework::coin {
     }
 
     #[resource_group_member(group = supra_framework::object::ObjectGroup)]
-    /// The flag the existence of which indicates the primary fungible store is created by the migration from CoinStore.
-    /// This struct was used to mark the migration from CoinStore to primary fungible store, but is no longer used.
-    /// Kept for the purpose of upgrade compatibility.
+    /// A member of a primary fungible store's object group that the framework neither writes nor reads.
+    /// Earlier framework versions added it on conversion from `CoinStore`, and those instances remain on chain.
+    /// The struct is kept because a published struct cannot be removed.
     struct MigrationFlag has key {}
 
     /// Capability required to mint coins.
@@ -658,79 +658,6 @@ module supra_framework::coin {
         *allow_upgrades = allowed;
     }
 
-    //
-    //  Aggregatable coin functions
-    //
-
-    /// Creates a new aggregatable coin with value overflowing on `limit`. Note that this function can
-    /// only be called by Supra Framework (0x1) account for now because of `create_aggregator`.
-    public(friend) fun initialize_aggregatable_coin<CoinType>(supra_framework: &signer): AggregatableCoin<CoinType> {
-        let aggregator = aggregator_factory::create_aggregator(supra_framework, MAX_U64);
-        AggregatableCoin<CoinType> {
-            value: aggregator,
-        }
-    }
-
-    /// Returns true if the value of aggregatable coin is zero.
-    public(friend) fun is_aggregatable_coin_zero<CoinType>(coin: &AggregatableCoin<CoinType>): bool {
-        let amount = aggregator::read(&coin.value);
-        amount == 0
-    }
-
-    /// Drains the aggregatable coin, setting it to zero and returning a standard coin.
-    public(friend) fun drain_aggregatable_coin<CoinType>(coin: &mut AggregatableCoin<CoinType>): Coin<CoinType> {
-        spec {};
-        let amount = aggregator::read(&coin.value);
-        assert!(amount <= MAX_U64, error::out_of_range(EAGGREGATABLE_COIN_VALUE_TOO_LARGE));
-        spec {};
-        aggregator::sub(&mut coin.value, amount);
-        spec {};
-        Coin<CoinType> {
-            value: (amount as u64),
-        }
-    }
-
-    /// Merges `coin` into aggregatable coin (`dst_coin`).
-    public(friend) fun merge_aggregatable_coin<CoinType>(dst_coin: &mut AggregatableCoin<CoinType>, coin: Coin<CoinType>) {
-        spec {};
-        let Coin { value } = coin;
-        let amount = (value as u128);
-        spec {};
-        aggregator::add(&mut dst_coin.value, amount);
-    }
-
-    /// Collects a specified amount of coin form an account into aggregatable coin.
-    public(friend) fun collect_into_aggregatable_coin<CoinType>(
-        account_addr: address,
-        amount: u64,
-        dst_coin: &mut AggregatableCoin<CoinType>,
-    ) acquires CoinStore, CoinConversionMap, CoinInfo, PairedCoinType {
-        // Skip collecting if amount is zero.
-        if (amount == 0) {
-            return
-        };
-
-        let (coin_amount_to_collect, fa_amount_to_collect) = calculate_amount_to_withdraw<CoinType>(
-            account_addr,
-            amount
-        );
-        let coin = if (coin_amount_to_collect != 0) {
-            let coin_store = borrow_global_mut<CoinStore<CoinType>>(account_addr);
-            extract(&mut coin_store.coin, coin_amount_to_collect)
-        } else {
-            zero()
-        };
-        if (fa_amount_to_collect != 0) {
-            let store_addr = primary_fungible_store::primary_store_address(
-                account_addr,
-                option::destroy_some(paired_metadata<CoinType>())
-            );
-            let fa = fungible_asset::withdraw_internal(store_addr, fa_amount_to_collect);
-            merge(&mut coin, fungible_asset_to_coin<CoinType>(fa));
-        };
-        merge_aggregatable_coin(dst_coin, coin);
-    }
-
     inline fun calculate_amount_to_withdraw<CoinType>(
         account_addr: address,
         amount: u64
@@ -759,7 +686,6 @@ module supra_framework::coin {
 
         let metadata = ensure_paired_metadata<CoinType>();
         let store = primary_fungible_store::ensure_primary_store_exists(account, metadata);
-        let store_address = object::object_address(&store);
         if (exists<CoinStore<CoinType>>(account)) {
             let CoinStore<CoinType> { coin, frozen, deposit_events, withdraw_events } = move_from<CoinStore<CoinType>>(
                 account
@@ -780,17 +706,11 @@ module supra_framework::coin {
             } else {
                 fungible_asset::deposit(store, coin_to_fungible_asset_internal(coin));
             };
-            // Note:
-            // It is possible the primary fungible store may already exist before this function call.
-            // In this case, if the account owns a frozen CoinStore and an unfrozen primary fungible store, this
-            // function would convert and deposit the rest coin into the primary store and freeze it to make the
-            // `frozen` semantic as consistent as possible.
-            if (frozen != fungible_asset::is_frozen(store)) {
-                fungible_asset::set_frozen_flag_internal(store, frozen);
+            // The primary fungible store may exist before this call. A frozen `CoinStore` freezes it, and the
+            // conversion never unfreezes it (#3268).
+            if (frozen && !fungible_asset::is_frozen(store)) {
+                fungible_asset::set_frozen_flag_internal(store, true);
             }
-        };
-        if (!exists<MigrationFlag>(store_address)) {
-            move_to(&create_signer::create_signer(store_address), MigrationFlag {});
         }
     }
 
@@ -808,6 +728,23 @@ module supra_framework::coin {
         account: &signer
     ) acquires CoinStore, CoinConversionMap, CoinInfo {
         maybe_convert_to_fungible_store<CoinType>(signer::address_of(account));
+    }
+
+    /// Migrate each account's `CoinStore<CoinType>` to its primary fungible store, as
+    /// `migrate_to_fungible_store` does for the signer. Accounts without a `CoinStore<CoinType>` are skipped.
+    /// Only SUPRA is supported.
+    public entry fun migrate_coin_store_to_fungible_store<CoinType>(
+        accounts: vector<address>
+    ) acquires CoinStore, CoinConversionMap, CoinInfo {
+        assert!(is_sup<CoinType>(), error::invalid_argument(EMIGRATION_UNSUPPORTED_COIN_TYPE));
+        if (!features::coin_to_fungible_asset_migration_feature_enabled()) {
+            abort error::unavailable(ECOIN_TO_FUNGIBLE_ASSET_FEATURE_NOT_ENABLED)
+        };
+        vector::for_each(accounts, |account| {
+            if (exists<CoinStore<CoinType>>(account)) {
+                maybe_convert_to_fungible_store<CoinType>(account);
+            }
+        });
     }
 
     //
@@ -1302,6 +1239,18 @@ module supra_framework::coin {
         if (is_account_registered<CoinType>(account_addr)) {
             return
         };
+        // While new accounts default to the SUPRA primary fungible store, or gas is charged from that store only,
+        // SUPRA is registered by creating that store rather than a `CoinStore`.
+        if (is_sup<CoinType>() && (
+            features::new_accounts_default_to_fa_supra_store_enabled()
+                || features::operations_default_to_fa_supra_store_enabled()
+        )) {
+            primary_fungible_store::ensure_primary_store_exists(
+                account_addr,
+                object::address_to_object<Metadata>(@supra_fungible_asset)
+            );
+            return
+        };
 
         account::register_coin<CoinType>(account_addr);
         let coin_store = CoinStore<CoinType> {
@@ -1465,7 +1414,7 @@ module supra_framework::coin {
     }
 
     #[test_only]
-    fun coin_store_exists<CoinType>(account: address): bool {
+    public fun coin_store_exists<CoinType>(account: address): bool {
         exists<CoinStore<CoinType>>(account)
     }
 
@@ -2008,57 +1957,6 @@ module supra_framework::coin {
     }
 
     #[test_only]
-    fun destroy_aggregatable_coin_for_test<CoinType>(aggregatable_coin: AggregatableCoin<CoinType>) {
-        let AggregatableCoin { value } = aggregatable_coin;
-        aggregator::destroy(value);
-    }
-
-    #[test(framework = @supra_framework)]
-    public entry fun test_collect_from_and_drain(
-        framework: signer,
-    ) acquires CoinInfo, CoinStore, CoinConversionMap, PairedCoinType {
-        let framework_addr = signer::address_of(&framework);
-        account::create_account_for_test(framework_addr);
-        let (burn_cap, freeze_cap, mint_cap) = initialize_and_register_fake_money(&framework, 1, true);
-
-        // Collect from coin store only.
-        let coins_minted = mint<FakeMoney>(100, &mint_cap);
-        deposit(framework_addr, coins_minted);
-        let aggregatable_coin = initialize_aggregatable_coin<FakeMoney>(&framework);
-        collect_into_aggregatable_coin<FakeMoney>(framework_addr, 50, &mut aggregatable_coin);
-
-        let fa_minted = coin_to_fungible_asset_internal(mint<FakeMoney>(100, &mint_cap));
-        primary_fungible_store::deposit(framework_addr, fa_minted);
-        assert!(balance<FakeMoney>(framework_addr) == 150, 0);
-        assert!(*option::borrow(&supply<FakeMoney>()) == 200, 0);
-
-        // Collect from coin store and fungible store.
-        collect_into_aggregatable_coin<FakeMoney>(framework_addr, 100, &mut aggregatable_coin);
-
-        assert!(balance<FakeMoney>(framework_addr) == 50, 0);
-        maybe_convert_to_fungible_store<FakeMoney>(framework_addr);
-        // Collect from fungible store only.
-        collect_into_aggregatable_coin<FakeMoney>(framework_addr, 30, &mut aggregatable_coin);
-
-        // Check that aggregatable coin has the right amount.
-        let collected_coin = drain_aggregatable_coin(&mut aggregatable_coin);
-        assert!(is_aggregatable_coin_zero(&aggregatable_coin), 0);
-        assert!(value(&collected_coin) == 180, 0);
-
-        // Supply of coins should be unchanged, but the balance on the account should decrease.
-        assert!(balance<FakeMoney>(framework_addr) == 20, 0);
-        assert!(*option::borrow(&supply<FakeMoney>()) == 200, 0);
-
-        burn(collected_coin, &burn_cap);
-        destroy_aggregatable_coin_for_test(aggregatable_coin);
-        move_to(&framework, FakeMoneyCapabilities {
-            burn_cap,
-            freeze_cap,
-            mint_cap,
-        });
-    }
-
-    #[test_only]
     fun deposit_to_coin_store<CoinType>(account_addr: address, coin: Coin<CoinType>) acquires CoinStore {
         assert!(
             coin_store_exists<CoinType>(account_addr),
@@ -2454,6 +2352,37 @@ module supra_framework::coin {
         deposit(account_addr, coin);
         assert!(coin_balance<FakeMoney>(account_addr) == 0, 0);
         assert!(balance<FakeMoney>(account_addr) == 100, 0);
+
+        move_to(account, FakeMoneyCapabilities {
+            burn_cap,
+            freeze_cap,
+            mint_cap,
+        });
+    }
+
+    #[test(account = @supra_framework, aaron = @0xaa10)]
+    fun test_conversion_writes_no_migration_flag(
+        account: &signer,
+        aaron: &signer,
+    ) acquires CoinConversionMap, CoinInfo, CoinStore {
+        let account_addr = signer::address_of(account);
+        let aaron_addr = signer::address_of(aaron);
+        account::create_account_for_test(account_addr);
+        account::create_account_for_test(aaron_addr);
+        let (burn_cap, freeze_cap, mint_cap) = initialize_and_register_fake_money(account, 1, true);
+        deposit(account_addr, mint<FakeMoney>(100, &mint_cap));
+        let metadata = ensure_paired_metadata<FakeMoney>();
+
+        // `account` has a `CoinStore` to convert; `aaron` has none.
+        maybe_convert_to_fungible_store<FakeMoney>(account_addr);
+        maybe_convert_to_fungible_store<FakeMoney>(aaron_addr);
+
+        assert!(!coin_store_exists<FakeMoney>(account_addr), 0);
+        assert!(primary_fungible_store::balance(account_addr, metadata) == 100, 0);
+        let account_store = primary_fungible_store::primary_store(account_addr, metadata);
+        assert!(!exists<MigrationFlag>(object::object_address(&account_store)), 0);
+        let aaron_store = primary_fungible_store::primary_store(aaron_addr, metadata);
+        assert!(!exists<MigrationFlag>(object::object_address(&aaron_store)), 0);
 
         move_to(account, FakeMoneyCapabilities {
             burn_cap,

@@ -825,7 +825,7 @@ module supra_framework::vesting_without_staking {
         vector::zip_mut<address, VestingRecord>(
             &mut keys,
             &mut values,
-            |shareholder, srecord| {
+            |_shareholder, srecord| {
                 let msrecord: &mut VestingRecord = srecord;
                 let new_last_vested_period =
                     (msrecord.last_vested_period * old_period_duration) / period_duration;

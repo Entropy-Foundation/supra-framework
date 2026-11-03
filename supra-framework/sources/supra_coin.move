@@ -277,6 +277,7 @@ module supra_framework::supra_coin {
         let name = string::utf8(b"Supra Coin");
         let symbol = string::utf8(b"SUPRA");
 
+        disable_fa_supra_store_defaults(&source);
         aggregator_factory::initialize_aggregator_factory_for_test(&source);
         let (burn_cap,  mint_cap) = initialize(
             &source,
@@ -318,6 +319,7 @@ module supra_framework::supra_coin {
         let destination_addr = signer::address_of(&destination);
         account::create_account_for_test(destination_addr);
 
+        disable_fa_supra_store_defaults(&source);
         aggregator_factory::initialize_aggregator_factory_for_test(&source);
         let (burn_cap,  mint_cap) = initialize(
             &source,
@@ -342,6 +344,7 @@ module supra_framework::supra_coin {
         let source_addr = signer::address_of(&source);
         account::create_account_for_test(source_addr);
 
+        disable_fa_supra_store_defaults(&source);
         aggregator_factory::initialize_aggregator_factory_for_test(&source);
         let (burn_cap, mint_cap) = initialize(
             &source,
@@ -389,6 +392,19 @@ module supra_framework::supra_coin {
     use supra_framework::primary_fungible_store;
 
     #[test_only]
+    /// Makes `coin::register<SupraCoin>` publish a `CoinStore`, the form these tests hold SUPRA in.
+    fun disable_fa_supra_store_defaults(supra_framework: &signer) {
+        features::change_feature_flags_for_testing(
+            supra_framework,
+            vector[],
+            vector[
+                features::get_new_accounts_default_to_fa_supra_store_feature(),
+                features::get_operations_default_to_fa_supra_store_feature(),
+            ],
+        );
+    }
+
+    #[test_only]
     fun setup_with_pairing(source: &signer): (BurnCapability<SupraCoin>, MintCapability<SupraCoin>) {
         account::create_account_for_test(signer::address_of(source));
         features::change_feature_flags_for_testing(
@@ -397,7 +413,10 @@ module supra_framework::supra_coin {
                 features::get_coin_to_fungible_asset_migration_feature(),
                 features::get_concurrent_fungible_assets_feature(),
             ],
-            vector[],
+            vector[
+                features::get_new_accounts_default_to_fa_supra_store_feature(),
+                features::get_operations_default_to_fa_supra_store_feature(),
+            ],
         );
         let (burn_cap, mint_cap) = initialize_for_test(source);
         coin::register<SupraCoin>(source);
