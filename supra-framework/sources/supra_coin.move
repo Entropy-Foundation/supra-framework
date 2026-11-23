@@ -60,6 +60,12 @@ module supra_framework::supra_coin {
         (burn_cap, mint_cap)
     }
 
+    /// Bound SUPRA in both its forms by `MAX_SUPRA_COIN_SUPPLY` through the paired fungible
+    /// asset's supply counter. Governance-only, applied once, and part of genesis for new chains.
+    public entry fun initialize_supply_ceiling(supra_framework: &signer) {
+        coin::initialize_paired_supply_ceiling<SupraCoin>(supra_framework, MAX_SUPRA_COIN_SUPPLY);
+    }
+
     public fun has_mint_capability(account: &signer): bool {
         exists<MintCapStore>(signer::address_of(account))
     }
@@ -354,5 +360,129 @@ module supra_framework::supra_coin {
             freeze_cap,
             mint_cap,
         });
+    }
+
+    #[test_only]
+    use supra_framework::features;
+    #[test_only]
+    use supra_framework::primary_fungible_store;
+
+    #[test_only]
+    fun setup_with_pairing(source: &signer): (BurnCapability<SupraCoin>, MintCapability<SupraCoin>) {
+        account::create_account_for_test(signer::address_of(source));
+        features::change_feature_flags_for_testing(
+            source,
+            vector[
+                features::get_coin_to_fungible_asset_migration_feature(),
+                features::get_concurrent_fungible_assets_feature(),
+            ],
+            vector[],
+        );
+        let (burn_cap, mint_cap) = initialize_for_test(source);
+        coin::register<SupraCoin>(source);
+        (burn_cap, mint_cap)
+    }
+
+    #[test_only]
+    fun setup_with_supply_ceiling(source: &signer): (BurnCapability<SupraCoin>, MintCapability<SupraCoin>) {
+        let (burn_cap, mint_cap) = setup_with_pairing(source);
+        initialize_supply_ceiling(source);
+        (burn_cap, mint_cap)
+    }
+
+    #[test_only]
+    fun total_supply(): u128 {
+        *option::borrow(&coin::supply<SupraCoin>())
+    }
+
+    #[test(source = @0x1)]
+    fun test_paired_counter_tracks_only_fungible_asset_until_activated(source: signer) {
+        let source_addr = signer::address_of(&source);
+        let (burn_cap, mint_cap) = setup_with_pairing(&source);
+        let metadata = option::destroy_some(coin::paired_metadata<SupraCoin>());
+        let max = (MAX_SUPRA_COIN_SUPPLY as u64);
+
+        let coins = coin::mint<SupraCoin>(max - 10, &mint_cap);
+        primary_fungible_store::deposit(source_addr, coin::coin_to_fungible_asset(coins));
+        coin::deposit(source_addr, coin::mint<SupraCoin>(10, &mint_cap));
+        assert!(fungible_asset::maximum(metadata) == option::none(), 1);
+        assert!(*option::borrow(&fungible_asset::supply(metadata)) == MAX_SUPRA_COIN_SUPPLY - 10, 2);
+        assert!(*option::borrow(&coin::coin_supply<SupraCoin>()) == 10, 3);
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY, 4);
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
+    }
+
+    #[test(source = @0x1)]
+    fun test_conversions_leave_the_bounded_counter_unchanged(source: signer) {
+        let source_addr = signer::address_of(&source);
+        let (burn_cap, mint_cap) = setup_with_supply_ceiling(&source);
+        let metadata = option::destroy_some(coin::paired_metadata<SupraCoin>());
+        let max = (MAX_SUPRA_COIN_SUPPLY as u64);
+        assert!(fungible_asset::maximum(metadata) == option::some(MAX_SUPRA_COIN_SUPPLY), 1);
+
+        let coins = coin::mint<SupraCoin>(max - 10, &mint_cap);
+        primary_fungible_store::deposit(source_addr, coin::coin_to_fungible_asset(coins));
+        assert!(*option::borrow(&coin::coin_supply<SupraCoin>()) == 0, 2);
+        assert!(*option::borrow(&fungible_asset::supply(metadata)) == MAX_SUPRA_COIN_SUPPLY - 10, 3);
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY - 10, 4);
+
+        // The remaining headroom can be minted, and a burn frees exactly what it removes.
+        coin::deposit(source_addr, coin::mint<SupraCoin>(10, &mint_cap));
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY, 5);
+        coin::burn(coin::withdraw<SupraCoin>(&source, 5), &burn_cap);
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY - 5, 6);
+        coin::deposit(source_addr, coin::mint<SupraCoin>(5, &mint_cap));
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY, 7);
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
+    }
+
+    #[test(source = @0x1)]
+    #[expected_failure(abort_code = 0x20005, location = supra_framework::fungible_asset)]
+    fun test_mint_past_supply_ceiling_is_rejected(source: signer) {
+        let source_addr = signer::address_of(&source);
+        let (burn_cap, mint_cap) = setup_with_supply_ceiling(&source);
+        let max = (MAX_SUPRA_COIN_SUPPLY as u64);
+        let coins = coin::mint<SupraCoin>(max - 1, &mint_cap);
+        primary_fungible_store::deposit(source_addr, coin::coin_to_fungible_asset(coins));
+        coin::deposit(source_addr, coin::mint<SupraCoin>(1, &mint_cap));
+        assert!(total_supply() == MAX_SUPRA_COIN_SUPPLY, 1);
+
+        coin::deposit(source_addr, coin::mint<SupraCoin>(1, &mint_cap));
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
+    }
+
+    #[test(source = @0x1)]
+    #[expected_failure(abort_code = 0x20005, location = supra_framework::fungible_asset)]
+    fun test_paired_mint_ref_is_bound_by_supply_ceiling(source: signer) {
+        let source_addr = signer::address_of(&source);
+        let (burn_cap, mint_cap) = setup_with_supply_ceiling(&source);
+        coin::deposit(source_addr, coin::mint<SupraCoin>((MAX_SUPRA_COIN_SUPPLY as u64), &mint_cap));
+
+        let (mint_ref, receipt) = coin::get_paired_mint_ref(&mint_cap);
+        primary_fungible_store::deposit(source_addr, fungible_asset::mint(&mint_ref, 1));
+        coin::return_paired_mint_ref(mint_ref, receipt);
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
+    }
+
+    #[test(source = @0x1)]
+    #[expected_failure(abort_code = 0x8001d, location = supra_framework::coin)]
+    fun test_supply_ceiling_is_initialized_once(source: signer) {
+        let (burn_cap, mint_cap) = setup_with_supply_ceiling(&source);
+        initialize_supply_ceiling(&source);
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
+    }
+
+    #[test(source = @0x1)]
+    #[expected_failure(abort_code = 0x1001e, location = supra_framework::coin)]
+    fun test_supply_ceiling_is_only_for_supra(source: signer) {
+        let (burn_cap, mint_cap) = setup_with_pairing(&source);
+        coin::initialize_paired_supply_ceiling<coin::FakeMoney>(&source, MAX_SUPRA_COIN_SUPPLY);
+        coin::destroy_burn_cap(burn_cap);
+        coin::destroy_mint_cap(mint_cap);
     }
 }

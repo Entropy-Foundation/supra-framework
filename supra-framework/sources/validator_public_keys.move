@@ -33,6 +33,10 @@ module supra_framework::validator_public_keys {
     const CERTIFICATE_THRESHOLD_TYPE_BCFT_FALLBACK_VIEW_CHANGE: u8 = 5;
     /// The integer should match the Rust enum value representation in `CertificateThresholdType`.
     /// f+1, given there are f Byzantine nodes in the [Committee] with n >= 2f + 1 nodes.
+    // The largest tag defined here. `aptos_types::dkg::payloads` carries it as
+    // `MAX_CERTIFICATE_THRESHOLD_TYPE`, to reject a DKG payload naming a tag that no key can be
+    // installed for, and `dkg_types` asserts the two agree. A tag added here has to be added there
+    // in the same release, or binaries carrying the old bound reject payloads this module accepts.
     const CERTIFICATE_THRESHOLD_TYPE_CLAN_MAJORITY: u8 = 6;
 
     /// Error: Unknown certificate threshold type.

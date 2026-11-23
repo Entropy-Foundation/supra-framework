@@ -1389,7 +1389,7 @@ module supra_framework::stake {
     /// Prefer this to `set_dkg_output_keys`, which recomputes the next validator set here at the end
     /// of the session instead. That recomputation is a different code path from the one that
     /// produced the session's target committee, so the two can disagree on either membership or
-    /// ordering: a length disagreement aborts, which fails the block on every node, and an ordering
+    /// ordering: a length disagreement aborts, and an ordering
     /// disagreement silently installs each validator's key share on a different validator.
     public(friend) fun set_dkg_output_keys_for_members(
         validator_addrs: vector<address>,
@@ -1440,7 +1440,13 @@ module supra_framework::stake {
                 let output_keys = dkg_committee::get_dkg_committee_output_keys(output);
                 let key_bytes = vector::borrow(&output_keys, i);
 
-                // Deserialize the key
+                // Deserialize the key.
+                //
+                // This check, and the threshold-tag check in the rotation below, apply to every key
+                // the framework installs, after `supra_dkg::build_committee_outputs` slices the
+                // payload, whatever checks the binary made before dispatching it. A change to that
+                // slicing, or to its order relative to these checks, is checked here. See
+                // Entropy-Foundation/smr-moonshot#3631.
                 let key_opt = aptos_std::bls12381::public_key_from_bytes(*key_bytes);
                 assert!(
                     option::is_some(&key_opt),

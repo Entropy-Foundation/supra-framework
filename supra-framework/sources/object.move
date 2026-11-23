@@ -50,6 +50,11 @@ module supra_framework::object {
     const EOBJECT_NOT_BURNT: u64 = 8;
     /// Object is untransferable any operations that might result in a transfer are disallowed.
     const EOBJECT_NOT_TRANSFERRABLE: u64 = 9;
+    /// Cannot burn an object that is already burnt.
+    const EOBJECT_ALREADY_BURNT: u64 = 10;
+    /// An ungated transfer cannot move a burnt object, or an object owned through a burnt object
+    /// other than the signer.
+    const EOBJECT_BURNT: u64 = 11;
 
     /// Explicitly separate the GUID space between Object and Account to prevent accidental overlap.
     const INIT_GUID_CREATION_NUM: u64 = 0x4000000000000;
@@ -89,7 +94,8 @@ module supra_framework::object {
     /// derivation to produce an object address.
     const OBJECT_FROM_SEED_ADDRESS_SCHEME: u8 = 0xFE;
 
-    /// Address where unwanted objects can be forcefully transferred to.
+    /// `unburn` returns a burnt object owned by this address to `TombStone.original_owner`.
+    /// Earlier framework versions burnt objects by transferring them here.
     const BURN_ADDRESS: address = @0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
 
     #[resource_group_member(group = supra_framework::object::ObjectGroup)]
@@ -107,9 +113,14 @@ module supra_framework::object {
     }
 
     #[resource_group_member(group = supra_framework::object::ObjectGroup)]
-    /// This is added to objects that are burnt (ownership transferred to BURN_ADDRESS).
+    /// Marks a burnt object. Indexers and wallets can hide an object that has one. An ungated
+    /// transfer cannot move a burnt object, or an object it owns directly or indirectly unless the
+    /// burnt object is the signer. `transfer_with_ref` moves a burnt object and removes the
+    /// `TombStone`.
     struct TombStone has key {
-        /// Track the previous owner before the object is burnt so they can reclaim later if so desired.
+        /// The object's owner when it was burnt. It is the object's owner for as long as the
+        /// `TombStone` exists, except for an object owned by `BURN_ADDRESS`, which `unburn` returns
+        /// to this address.
         original_owner: address,
     }
 
@@ -176,6 +187,21 @@ module supra_framework::object {
         object: address,
         from: address,
         to: address,
+    }
+
+    #[event]
+    /// Emitted when `burn` adds a `TombStone` to `object`, which `owner` owns.
+    struct Burn has drop, store {
+        object: address,
+        owner: address,
+    }
+
+    #[event]
+    /// Emitted when `unburn` or `transfer_with_ref` removes the `TombStone` from `object`. `owner`
+    /// is the object's owner after the change.
+    struct Unburn has drop, store {
+        object: address,
+        owner: address,
     }
 
     #[view]
@@ -481,6 +507,7 @@ module supra_framework::object {
         // Undo soft burn if present as we don't want the original owner to be able to reclaim by calling unburn later.
         if (exists<TombStone>(ref.self)) {
             let TombStone { original_owner: _ } = move_from<TombStone>(ref.self);
+            event::emit(Unburn { object: ref.self, owner: to });
         };
 
         let object = borrow_global_mut<ObjectCore>(ref.self);
@@ -530,7 +557,7 @@ module supra_framework::object {
     /// Attempts to transfer using addresses only. Transfers the given object if
     /// allow_ungated_transfer is set true. Note, that this allows the owner of a nested object to
     /// transfer that object, so long as allow_ungated_transfer is enabled at each stage in the
-    /// hierarchy.
+    /// hierarchy. Aborts if the object, or any object between it and `owner`, is burnt.
     public fun transfer_raw(
         owner: &signer,
         object: address,
@@ -589,6 +616,7 @@ module supra_framework::object {
             object.allow_ungated_transfer,
             error::permission_denied(ENO_UNGATED_TRANSFERS),
         );
+        assert!(!exists<TombStone>(current_address), error::invalid_argument(EOBJECT_BURNT));
 
         let current_address = object.owner;
         let count = 0;
@@ -606,22 +634,29 @@ module supra_framework::object {
                 object.allow_ungated_transfer,
                 error::permission_denied(ENO_UNGATED_TRANSFERS),
             );
+            assert!(!exists<TombStone>(current_address), error::invalid_argument(EOBJECT_BURNT));
             current_address = object.owner;
         };
     }
 
-    /// Forcefully transfer an unwanted object to BURN_ADDRESS, ignoring whether ungated_transfer is allowed.
+    /// Mark an unwanted object as burnt by adding a `TombStone`, ignoring whether ungated_transfer
+    /// is allowed. The owner does not change. Indexers and wallets can hide burnt objects. Until
+    /// it is unburnt, an ungated transfer cannot move the object, or an object it owns directly or
+    /// indirectly unless the object is the signer.
     /// This only works for objects directly owned and for simplicity does not apply to indirectly owned objects.
-    /// Original owners can reclaim burnt objects any time in the future by calling unburn.
+    /// The owner can reverse this at any time by calling unburn.
     public entry fun burn<T: key>(owner: &signer, object: Object<T>) acquires ObjectCore {
         let original_owner = signer::address_of(owner);
         assert!(is_owner(object, original_owner), error::permission_denied(ENOT_OBJECT_OWNER));
         let object_addr = object.inner;
+        assert!(!exists<TombStone>(object_addr), error::invalid_argument(EOBJECT_ALREADY_BURNT));
         move_to(&create_signer(object_addr), TombStone { original_owner });
-        transfer_raw_inner(object_addr, BURN_ADDRESS);
+        event::emit(Burn { object: object_addr, owner: original_owner });
     }
 
-    /// Allow origin owners to reclaim any objects they previous burnt.
+    /// Remove the `TombStone` from a burnt object. The signer must be the object's direct owner,
+    /// except for an object owned by `BURN_ADDRESS`, which is returned to
+    /// `TombStone.original_owner`, who must be the signer.
     public entry fun unburn<T: key>(
         original_owner: &signer,
         object: Object<T>,
@@ -629,9 +664,16 @@ module supra_framework::object {
         let object_addr = object.inner;
         assert!(exists<TombStone>(object_addr), error::invalid_argument(EOBJECT_NOT_BURNT));
 
+        let signer_addr = signer::address_of(original_owner);
+        let owner_addr = borrow_global<ObjectCore>(object_addr).owner;
         let TombStone { original_owner: original_owner_addr } = move_from<TombStone>(object_addr);
-        assert!(original_owner_addr == signer::address_of(original_owner), error::permission_denied(ENOT_OBJECT_OWNER));
-        transfer_raw_inner(object_addr, original_owner_addr);
+        if (owner_addr == BURN_ADDRESS) {
+            assert!(original_owner_addr == signer_addr, error::permission_denied(ENOT_OBJECT_OWNER));
+            transfer_raw_inner(object_addr, original_owner_addr);
+        } else {
+            assert!(owner_addr == signer_addr, error::permission_denied(ENOT_OBJECT_OWNER));
+        };
+        event::emit(Unburn { object: object_addr, owner: signer_addr });
     }
 
     /// Accessors
@@ -777,6 +819,17 @@ module supra_framework::object {
         );
     }
 
+    #[test_only]
+    /// Burns `object` as earlier framework versions did: adds a `TombStone` and transfers the
+    /// object to `BURN_ADDRESS`. Objects in this state exist on chain.
+    public fun burn_object_with_transfer<T: key>(owner: &signer, object: Object<T>) acquires ObjectCore {
+        let original_owner = signer::address_of(owner);
+        assert!(is_owner(object, original_owner), error::permission_denied(ENOT_OBJECT_OWNER));
+        let object_addr = object.inner;
+        move_to(&create_signer(object_addr), TombStone { original_owner });
+        transfer_raw_inner(object_addr, BURN_ADDRESS);
+    }
+
     #[test(creator = @0x123)]
     fun test_object(creator: &signer) acquires Hero, ObjectCore {
         let (_, hero) = create_hero(creator);
@@ -824,6 +877,35 @@ module supra_framework::object {
         let transfer_ref = generate_transfer_ref(&hero_constructor);
         transfer_with_ref(generate_linear_transfer_ref(&transfer_ref), @0x456);
         unburn(creator, hero);
+    }
+
+    #[test(creator = @0x123)]
+    #[expected_failure(abort_code = 0x10008, location = Self)]
+    fun test_cannot_unburn_with_transfer_after_transfer_with_ref(
+        creator: &signer
+    ) acquires ObjectCore, TombStone {
+        let (hero_constructor, hero) = create_hero(creator);
+        burn_object_with_transfer(creator, hero);
+        let transfer_ref = generate_transfer_ref(&hero_constructor);
+        transfer_with_ref(generate_linear_transfer_ref(&transfer_ref), @0x456);
+        unburn(creator, hero);
+    }
+
+    #[test(creator = @0x123)]
+    fun test_transfer_with_ref_unburns_and_emits_unburn(creator: &signer) acquires ObjectCore, TombStone {
+        let (hero_constructor, hero) = create_hero(creator);
+        let object = object_address(&hero);
+        let transfer_ref = generate_transfer_ref(&hero_constructor);
+
+        // An object that is not burnt emits no `Unburn`.
+        transfer_with_ref(generate_linear_transfer_ref(&transfer_ref), @0x123);
+        assert!(vector::is_empty(&event::emitted_events<Unburn>()), 0);
+
+        burn(creator, hero);
+        transfer_with_ref(generate_linear_transfer_ref(&transfer_ref), @0x456);
+        assert!(!is_burnt(hero), 1);
+        assert!(owner(hero) == @0x456, 2);
+        assert!(event::emitted_events<Unburn>() == vector[Unburn { object, owner: @0x456 }], 3);
     }
 
     #[test(fx = @std)]
@@ -877,14 +959,95 @@ module supra_framework::object {
 
         // Owner should be able to burn, despite ungated transfer disallowed.
         burn(creator, hero);
-        assert!(owner(hero) == BURN_ADDRESS, 0);
-        assert!(!ungated_transfer_allowed(hero), 0);
+        assert!(owner(hero) == @0x123, 0);
+        assert!(is_burnt(hero), 1);
+        assert!(!ungated_transfer_allowed(hero), 2);
+        let object = object_address(&hero);
+        assert!(event::emitted_events<Burn>() == vector[Burn { object, owner: @0x123 }], 3);
+        assert!(transfer_event_count(object) == 0, 4);
 
         // Owner should be able to reclaim.
         unburn(creator, hero);
-        assert!(owner(hero) == signer::address_of(creator), 0);
+        assert!(owner(hero) == @0x123, 5);
+        assert!(!is_burnt(hero), 6);
         // Object still frozen.
-        assert!(!ungated_transfer_allowed(hero), 0);
+        assert!(!ungated_transfer_allowed(hero), 7);
+        assert!(event::emitted_events<Unburn>() == vector[Unburn { object, owner: @0x123 }], 8);
+        assert!(transfer_event_count(object) == 0, 9);
+
+        // An unburnt object can be transferred.
+        enable_ungated_transfer(&transfer_ref);
+        transfer(creator, hero, @0x456);
+        assert!(owner(hero) == @0x456, 10);
+    }
+
+    #[test(creator = @0x123)]
+    #[expected_failure(abort_code = 0x1000B, location = Self)]
+    fun test_transfer_burnt_object_should_fail(creator: &signer) acquires ObjectCore {
+        let (_, hero) = create_hero(creator);
+        burn(creator, hero);
+        transfer(creator, hero, @0x456);
+    }
+
+    #[test(creator = @0x123)]
+    #[expected_failure(abort_code = 0x1000B, location = Self)]
+    fun test_transfer_object_owned_by_burnt_object_should_fail(creator: &signer) acquires ObjectCore {
+        let (_, hero) = create_hero(creator);
+        let (_, weapon) = create_weapon(creator);
+        transfer_to_object(creator, weapon, hero);
+        burn(creator, hero);
+        transfer(creator, weapon, @0x456);
+    }
+
+    #[test(creator = @0x123)]
+    fun test_unburn_object_burnt_with_transfer(creator: &signer) acquires ObjectCore, TombStone {
+        let (hero_constructor, hero) = create_hero(creator);
+        let transfer_ref = generate_transfer_ref(&hero_constructor);
+        disable_ungated_transfer(&transfer_ref);
+        burn_object_with_transfer(creator, hero);
+        assert!(owner(hero) == BURN_ADDRESS, 0);
+
+        // The original owner reclaims the object.
+        unburn(creator, hero);
+        assert!(owner(hero) == @0x123, 1);
+        assert!(!is_burnt(hero), 2);
+        assert!(!ungated_transfer_allowed(hero), 3);
+        let object = object_address(&hero);
+        assert!(event::emitted_events<Unburn>() == vector[Unburn { object, owner: @0x123 }], 4);
+        // The transfer to `BURN_ADDRESS` and the transfer back.
+        assert!(transfer_event_count(object) == 2, 5);
+    }
+
+    #[test_only]
+    fun transfer_event_count(object: address): u64 acquires ObjectCore {
+        event::counter(&borrow_global<ObjectCore>(object).transfer_events)
+    }
+
+    #[test(creator = @0x123)]
+    #[expected_failure(abort_code = 0x1000A, location = Self)]
+    fun test_burn_burnt_object_should_fail(creator: &signer) acquires ObjectCore {
+        let (_, hero) = create_hero(creator);
+        burn(creator, hero);
+        burn(creator, hero);
+    }
+
+    #[test(creator = @0x123, other = @0x456)]
+    #[expected_failure(abort_code = 0x50004, location = Self)]
+    fun test_unburn_by_non_owner_should_fail(creator: &signer, other: &signer) acquires ObjectCore, TombStone {
+        let (_, hero) = create_hero(creator);
+        burn(creator, hero);
+        unburn(other, hero);
+    }
+
+    #[test(creator = @0x123, other = @0x456)]
+    #[expected_failure(abort_code = 0x50004, location = Self)]
+    fun test_unburn_object_burnt_with_transfer_by_non_original_owner_should_fail(
+        creator: &signer,
+        other: &signer,
+    ) acquires ObjectCore, TombStone {
+        let (_, hero) = create_hero(creator);
+        burn_object_with_transfer(creator, hero);
+        unburn(other, hero);
     }
 
     #[test(creator = @0x123)]

@@ -213,6 +213,8 @@ module supra_framework::genesis {
         let (burn_cap, mint_cap) = supra_coin::initialize(supra_framework);
         coin::create_coin_conversion_map(supra_framework);
         coin::create_pairing<SupraCoin>(supra_framework);
+        // The paired fungible asset's supply counter bounds SUPRA in both forms from genesis.
+        supra_coin::initialize_supply_ceiling(supra_framework);
         // Give stake module MintCapability<SupraCoin> so it can mint rewards.
         stake::store_supra_coin_mint_cap(supra_framework, mint_cap);
         // Give transaction_fee module BurnCapability<SupraCoin> so it can burn gas.
@@ -276,6 +278,8 @@ module supra_framework::genesis {
         let (burn_cap, mint_cap) = supra_coin::initialize(supra_framework);
         coin::create_coin_conversion_map(supra_framework);
         coin::create_pairing<SupraCoin>(supra_framework);
+        // The paired fungible asset's supply counter bounds SUPRA in both forms from genesis.
+        supra_coin::initialize_supply_ceiling(supra_framework);
         // Give stake module MintCapability<SupraCoin> so it can mint rewards.
         stake::store_supra_coin_mint_cap(supra_framework, mint_cap);
         // Give transaction_fee module BurnCapability<SupraCoin> so it can burn gas.

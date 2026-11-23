@@ -449,7 +449,7 @@ module supra_framework::supra_dkg {
 
             // Install the keys against the membership this session pinned when it started, not
             // against a set recomputed now. The two are produced by different code paths, and a
-            // disagreement between them aborts in `stake`, which fails the block on every node.
+            // disagreement between them aborts in `stake`.
             let members = target_committee_member_addrs(&session.metadata);
 
             borrow_global_mut<DkgSessionLastCompleted>(@supra_framework).session = option::some(

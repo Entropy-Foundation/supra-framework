@@ -374,6 +374,7 @@ module supra_framework::primary_fungible_store {
         let user_2_primary_store = primary_store(user_2_address, metadata);
         object::burn(user_2, user_2_primary_store);
         assert!(object::is_burnt(user_2_primary_store), 0);
+        assert!(object::owner(user_2_primary_store) == user_2_address, 0);
         // Balance still works
         assert!(balance(user_2_address, metadata) == 80, 0);
         // Deposit still works
@@ -400,6 +401,36 @@ module supra_framework::primary_fungible_store {
         assert!(object::is_burnt(user_2_primary_store), 0);
         let coins = withdraw(user_2, metadata, 70);
         assert!(balance(user_2_address, metadata) == 10, 0);
+        deposit(user_2_address, coins);
+    }
+
+    #[test(user_1 = @0xcafe, user_2 = @0xface)]
+    fun test_withdraw_from_store_burnt_with_transfer(
+        user_1: &signer,
+        user_2: &signer,
+    ) acquires DeriveRefPod {
+        let (creator_ref, metadata) = create_test_token(user_1);
+        let (mint_ref, _, _) = init_test_metadata_with_primary_store_enabled(&creator_ref);
+        let user_1_address = signer::address_of(user_1);
+        let user_2_address = signer::address_of(user_2);
+        mint(&mint_ref, user_1_address, 100);
+        transfer(user_1, metadata, user_2_address, 80);
+
+        // A store burnt by transfer to the burn address is found by its address and returned to
+        // its owner by the first withdrawal.
+        let user_2_primary_store = primary_store(user_2_address, metadata);
+        object::burn_object_with_transfer(user_2, user_2_primary_store);
+        assert!(
+            object::owner(user_2_primary_store)
+                == @0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff,
+            0
+        );
+        assert!(balance(user_2_address, metadata) == 80, 0);
+        transfer(user_1, metadata, user_2_address, 20);
+        let coins = withdraw(user_2, metadata, 70);
+        assert!(!object::is_burnt(user_2_primary_store), 0);
+        assert!(object::owner(user_2_primary_store) == user_2_address, 0);
+        assert!(balance(user_2_address, metadata) == 30, 0);
         deposit(user_2_address, coins);
     }
 }
