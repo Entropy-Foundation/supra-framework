@@ -10,6 +10,10 @@ module supra_framework::event {
     friend supra_framework::account;
     friend supra_framework::object;
 
+    /// An event cannot be created. This error is returned by native implementations when:
+    ///   - The type tag for the event is too deeply nested.
+    const ECANNOT_CREATE_EVENT: u64 = 1;
+
     /// Emit a module event with payload `msg`.
     public fun emit<T: store + drop>(msg: T) {
         write_module_event_to_store<T>(msg);

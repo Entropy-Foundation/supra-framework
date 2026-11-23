@@ -26,6 +26,12 @@ module supra_framework::leader_ban_registry_config {
     const EINVALID_VERSION_BYTES: u64 = 3;
     /// The BanRegistryParameters already initialised
     const EALREADY_INITIALISED: u64 = 4;
+    /// The provided on chain config version has no decoder in this module
+    const EUNSUPPORTED_VERSION: u64 = 5;
+
+    /// Length in bytes of the BCS encoding of `BanRegistryParametersV0`:
+    /// `u8` + `u32` + `u8` + `u8`.
+    const BAN_REGISTRY_PARAMETERS_V0_BCS_LENGTH: u64 = 7;
 
     /// Holds ban registry parameters bytes and it's version
     struct BanRegistryParameters has drop, key, store {
@@ -71,6 +77,9 @@ module supra_framework::leader_ban_registry_config {
     }
 
     /// This can be called by on-chain governance to update on-chain configs for the next epoch.
+    /// `config` must decode as the parameters of `version`, and version 0 is the only version
+    /// with a decoder; otherwise this aborts and nothing is buffered, so every buffered config
+    /// is one `on_new_epoch` can apply. See Entropy-Foundation/smr-moonshot#3237.
     /// Example usage:
     /// ```
     /// supra_framework::leader_ban_registry_config::set_for_next_epoch(&framework_signer, some_config_bytes, version);
@@ -89,6 +98,11 @@ module supra_framework::leader_ban_registry_config {
                 error::invalid_argument(EINVALID_VERSION)
             );
         };
+        assert!(version == 0, error::invalid_argument(EUNSUPPORTED_VERSION));
+        assert!(
+            option::is_some(&deserialise_v0_params(config)),
+            error::invalid_argument(EINVALID_VERSION_BYTES)
+        );
         std::config_buffer::upsert<BanRegistryParameters>(
             BanRegistryParameters { config, version }
         );
@@ -109,7 +123,9 @@ module supra_framework::leader_ban_registry_config {
             let params = borrow_global<BanRegistryParameters>(@supra_framework);
             if (params.version == 0) {
                 let v0 = deserialise_v0_params(params.config);
-                // This is to prevent abort on new epoch if deserialise failed.
+                // `deserialise_v0_params` does not abort, so an undecodable config leaves
+                // the current `BanRegistryParametersV0` in place instead of aborting the
+                // epoch change.
                 if (option::is_some(&v0)) {
                     let ban_registry_params = option::extract(&mut v0);
                     if (exists<BanRegistryParametersV0>(@supra_framework)) {
@@ -208,14 +224,18 @@ module supra_framework::leader_ban_registry_config {
         0
     }
 
-    /// Decoding bytes to `BanRegistryParametersV0` using bcs
+    /// Decodes `bytes` as the BCS encoding of `BanRegistryParametersV0`. Returns `none` unless
+    /// `bytes` is exactly `BAN_REGISTRY_PARAMETERS_V0_BCS_LENGTH` long. Does not abort.
     fun deserialise_v0_params(bytes: vector<u8>): Option<BanRegistryParametersV0> {
+        if (vector::length(&bytes) != BAN_REGISTRY_PARAMETERS_V0_BCS_LENGTH) {
+            return option::none<BanRegistryParametersV0>()
+        };
         let bcs_bytes = decode_bcs::new(bytes);
         let initial_elections_denied: u8 = decode_bcs::peel_u8(&mut bcs_bytes);
         let max_elections_denied: u32 = decode_bcs::peel_u32(&mut bcs_bytes);
         let minimum_unbanned_proposers: u8 = decode_bcs::peel_u8(&mut bcs_bytes);
         let probation_elections: u8 = decode_bcs::peel_u8(&mut bcs_bytes);
-        // making sure no bytes left to decode means correct parameter version
+        // The decoded fields must consume the whole input.
         if (vector::length(&decode_bcs::into_remainder_bytes(bcs_bytes)) == 0) {
             return option::some(
                 BanRegistryParametersV0 {
@@ -252,6 +272,14 @@ module supra_framework::leader_ban_registry_config {
             minimum_unbanned_proposers,
             probation_elections
         }
+    }
+
+    #[test_only]
+    /// Buffers `config` without the checks `set_for_next_epoch` applies.
+    public fun buffer_without_validation_for_test(config: vector<u8>, version: u8) {
+        config_buffer::upsert<BanRegistryParameters>(
+            BanRegistryParameters { config, version }
+        );
     }
 
     #[test_only]

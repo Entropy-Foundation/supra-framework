@@ -3,6 +3,7 @@
 module supra_framework::fungible_asset {
     use supra_framework::aggregator_v2::{Self, Aggregator};
     use supra_framework::create_signer;
+    use supra_framework::system_addresses;
     use supra_framework::event;
     use supra_framework::function_info::{Self, FunctionInfo};
     use supra_framework::object::{Self, Object, ConstructorRef, DeleteRef, ExtendRef};
@@ -1002,8 +1003,9 @@ module supra_framework::fungible_asset {
         FungibleAsset { metadata, amount }
     }
 
-    /// Increase the supply of a fungible asset by minting.
-    fun increase_supply<T: key>(metadata: &Object<T>, amount: u64) acquires Supply, ConcurrentSupply {
+    /// Increase the supply of a fungible asset, by minting or on behalf of a paired coin whose
+    /// supply the counter also accounts for.
+    public(friend) fun increase_supply<T: key>(metadata: &Object<T>, amount: u64) acquires Supply, ConcurrentSupply {
         if (amount == 0) {
             return
         };
@@ -1030,8 +1032,9 @@ module supra_framework::fungible_asset {
         }
     }
 
-    /// Decrease the supply of a fungible asset by burning.
-    fun decrease_supply<T: key>(metadata: &Object<T>, amount: u64) acquires Supply, ConcurrentSupply {
+    /// Decrease the supply of a fungible asset, by burning or on behalf of a paired coin whose
+    /// supply the counter also accounts for.
+    public(friend) fun decrease_supply<T: key>(metadata: &Object<T>, amount: u64) acquires Supply, ConcurrentSupply {
         if (amount == 0) {
             return
         };
@@ -1075,6 +1078,24 @@ module supra_framework::fungible_asset {
         let store_addr = object::object_address(store);
         assert!(exists<FungibleStore>(store_addr), error::not_found(EFUNGIBLE_STORE_EXISTENCE));
         borrow_global<FungibleStore>(store_addr)
+    }
+
+    /// Restart the concurrent supply counter of `metadata` at `current`, bounded by `maximum`.
+    /// This is the activation step for a paired coin whose supply the counter accounts for from
+    /// then on; it is governance-only and is not for a counter that is already in that role. The
+    /// counter must be concurrent, since every movement of the paired coin's supply reaches it.
+    /// The counter is replaced with a new aggregator rather than adjusted in place.
+    public(friend) fun reset_supply<T: key>(
+        supra_framework: &signer,
+        metadata: &Object<T>,
+        current: u128,
+        maximum: u128,
+    ) acquires ConcurrentSupply {
+        system_addresses::assert_supra_framework(supra_framework);
+        let metadata_address = object::object_address(metadata);
+        assert!(exists<ConcurrentSupply>(metadata_address), error::not_found(ESUPPLY_NOT_FOUND));
+        let supply = borrow_global_mut<ConcurrentSupply>(metadata_address);
+        supply.current = aggregator_v2::create_aggregator_with_value(current, maximum);
     }
 
     public fun upgrade_to_concurrent(

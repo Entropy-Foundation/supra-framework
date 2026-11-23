@@ -107,6 +107,11 @@ module supra_framework::coin {
     /// SUPRA pairing is not eanbled yet.
     const ESUP_PAIRING_IS_NOT_ENABLED: u64 = 28;
 
+    /// The paired fungible asset already carries the supply ceiling.
+    const EPAIRED_SUPPLY_CEILING_EXISTS: u64 = 29;
+    /// Only SUPRA carries a supply ceiling on its paired fungible asset.
+    const EPAIRED_SUPPLY_CEILING_UNSUPPORTED: u64 = 30;
+
     //
     // Constants
     //
@@ -251,6 +256,15 @@ module supra_framework::coin {
     }
 
     #[resource_group_member(group = supra_framework::object::ObjectGroup)]
+    /// Marks a paired fungible asset whose supply counter accounts for the coin and the fungible
+    /// asset together and carries the supply ceiling as its maximum. Coin mints and burns are
+    /// mirrored into that counter; conversions between the two forms leave it unchanged.
+    ///
+    /// The marker shares the paired metadata's object group with the supply counter, and is
+    /// stored in the transaction that calls `fungible_asset::reset_supply`.
+    struct PairedSupplyCeiling has key {}
+
+    #[resource_group_member(group = supra_framework::object::ObjectGroup)]
     /// The refs of the paired fungible asset.
     struct PairedFungibleAssetRefs has key {
         mint_ref_opt: Option<MintRef>,
@@ -310,6 +324,41 @@ module supra_framework::coin {
 
     inline fun is_sup<CoinType>(): bool {
         type_info::type_name<CoinType>() == string::utf8(b"0x1::supra_coin::SupraCoin")
+    }
+
+    /// The paired metadata of `CoinType` when its supply counter carries the supply ceiling. The
+    /// SUPRA pairing lives at `@supra_fungible_asset`, so the marker is read there directly: no
+    /// conversion-map lookup, and no dependence on the coin-to-fungible-asset migration feature.
+    inline fun ceiling_bearing_metadata<CoinType>(): Option<Object<Metadata>> {
+        if (is_sup<CoinType>() && exists<PairedSupplyCeiling>(@supra_fungible_asset)) {
+            option::some(object::address_to_object<Metadata>(@supra_fungible_asset))
+        } else {
+            option::none()
+        }
+    }
+
+    /// Make the paired fungible asset's supply counter account for `CoinType` in both forms, with
+    /// `ceiling` as its maximum. The counter starts at the current combined supply. From then on
+    /// coin mints and burns are mirrored into it and conversions leave it unchanged.
+    public fun initialize_paired_supply_ceiling<CoinType>(
+        supra_framework: &signer,
+        ceiling: u128,
+    ) acquires CoinInfo, CoinConversionMap {
+        system_addresses::assert_supra_framework(supra_framework);
+        assert!(is_sup<CoinType>(), error::invalid_argument(EPAIRED_SUPPLY_CEILING_UNSUPPORTED));
+        let metadata = assert_paired_metadata_exists<CoinType>();
+        let metadata_addr = object_address(&metadata);
+        assert!(
+            metadata_addr == @supra_fungible_asset,
+            error::invalid_state(EPAIRED_SUPPLY_CEILING_UNSUPPORTED)
+        );
+        assert!(
+            !exists<PairedSupplyCeiling>(metadata_addr),
+            error::already_exists(EPAIRED_SUPPLY_CEILING_EXISTS)
+        );
+        let total = option::destroy_some(supply<CoinType>());
+        fungible_asset::reset_supply(supra_framework, &metadata, total, ceiling);
+        move_to(&create_signer::create_signer(metadata_addr), PairedSupplyCeiling {});
     }
 
     inline fun create_and_return_paired_metadata_if_not_exist<CoinType>(allow_sup_creation: bool): Object<Metadata> {
@@ -704,13 +753,10 @@ module supra_framework::coin {
             } else {
                 fungible_asset::deposit(store, coin_to_fungible_asset_internal(coin));
             };
-            // Note:
-            // It is possible the primary fungible store may already exist before this function call.
-            // In this case, if the account owns a frozen CoinStore and an unfrozen primary fungible store, this
-            // function would convert and deposit the rest coin into the primary store and freeze it to make the
-            // `frozen` semantic as consistent as possible.
-            if (frozen != fungible_asset::is_frozen(store)) {
-                fungible_asset::set_frozen_flag_internal(store, frozen);
+            // The primary fungible store may exist before this call. A frozen `CoinStore` freezes it, and the
+            // conversion never unfreezes it (#3268).
+            if (frozen && !fungible_asset::is_frozen(store)) {
+                fungible_asset::set_frozen_flag_internal(store, true);
             }
         };
         if (!exists<MigrationFlag>(store_address)) {
@@ -843,8 +889,13 @@ module supra_framework::coin {
     }
 
     #[view]
-    /// Returns the amount of coin in existence.
+    /// Returns the amount of coin in existence, in both forms where a pairing exists.
     public fun supply<CoinType>(): Option<u128> acquires CoinInfo, CoinConversionMap {
+        let ceiling = ceiling_bearing_metadata<CoinType>();
+        if (option::is_some(&ceiling)) {
+            // The paired counter accounts for both forms; the coin-side counter is not consulted.
+            return fungible_asset::supply(option::destroy_some(ceiling))
+        };
         let coin_supply = coin_supply<CoinType>();
         let metadata = paired_metadata<CoinType>();
         if (option::is_some(&metadata)) {
@@ -1280,6 +1331,11 @@ module supra_framework::coin {
             }
         };
 
+        let ceiling = ceiling_bearing_metadata<CoinType>();
+        if (option::is_some(&ceiling)) {
+            fungible_asset::increase_supply(option::borrow(&ceiling), amount);
+        };
+
         let maybe_supply = &mut borrow_global_mut<CoinInfo<CoinType>>(coin_address<CoinType>()).supply;
         if (option::is_some(maybe_supply)) {
             let supply = option::borrow_mut(maybe_supply);
@@ -1294,6 +1350,10 @@ module supra_framework::coin {
         spec {};
         let Coin { value: amount } = coin;
         if (amount != 0) {
+            let ceiling = ceiling_bearing_metadata<CoinType>();
+            if (option::is_some(&ceiling)) {
+                fungible_asset::decrease_supply(option::borrow(&ceiling), amount);
+            };
             let maybe_supply = &mut borrow_global_mut<CoinInfo<CoinType>>(coin_address<CoinType>()).supply;
             if (option::is_some(maybe_supply)) {
                 let supply = option::borrow_mut(maybe_supply);
@@ -1335,7 +1395,7 @@ module supra_framework::coin {
     }
 
     #[test_only]
-    fun coin_store_exists<CoinType>(account: address): bool {
+    public fun coin_store_exists<CoinType>(account: address): bool {
         exists<CoinStore<CoinType>>(account)
     }
 
