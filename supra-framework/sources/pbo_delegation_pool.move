@@ -500,6 +500,9 @@ module supra_framework::pbo_delegation_pool {
     }
 
     #[event]
+    /// `amount` is the newly locked amount when emitted by `fund_delegators_with_locked_stake`, and
+    /// the delegator's new principle stake when emitted by `lock_delegators_stakes` or
+    /// `cap_principle_stakes`.
     struct UnlockScheduleApplied has drop, store {
         pool_address: address,
         delegator: address,
@@ -985,6 +988,114 @@ module supra_framework::pbo_delegation_pool {
             },
         );
 
+    }
+
+    /// Replaces the unlock schedule of the principle stake of `pool_address` and marks none of that
+    /// stake as unlocked, so that the whole principle stake of every delegator is locked until
+    /// `unlock_start_time` and then unlocks according to the new schedule. Unlike
+    /// `update_unlocking_schedule`, this may be called after unlocking has started.
+    /// `unlock_start_time` must be later than the current time.
+    ///
+    /// A delegator whose `active` balance is below their principle stake cannot unlock any stake
+    /// until `cap_principle_stakes` has lowered their principle stake to that balance.
+    ///
+    /// This function exists to enable The Supra Foundation to lock principle stake again. It will be
+    /// deactivated before the validator set is opened up to external validator-owners.
+    public entry fun reset_unlocking_schedule(
+        multisig_admin: &signer,
+        pool_address: address,
+        unlock_numerators: vector<u64>,
+        unlock_denominator: u64,
+        unlock_start_time: u64,
+        unlock_duration: u64
+    ) acquires DelegationPool {
+        assert!(
+            is_admin(signer::address_of(multisig_admin), pool_address),
+            error::permission_denied(ENOT_AUTHORIZED),
+        );
+        assert!(
+            unlock_start_time > timestamp::now_seconds(),
+            error::invalid_argument(ESTARTUP_TIME_IN_PAST),
+        );
+
+        validate_unlock_schedule_params(
+            &unlock_numerators,
+            unlock_denominator,
+            unlock_start_time,
+            unlock_duration,
+        );
+
+        let schedule = create_schedule_fractions(&unlock_numerators, unlock_denominator);
+
+        let pool = borrow_global_mut<DelegationPool>(pool_address);
+        pool.principle_unlock_schedule = UnlockSchedule {
+            schedule,
+            start_timestamp_secs: unlock_start_time,
+            period_duration: unlock_duration,
+            last_unlock_period: 0,
+            cumulative_unlocked_fraction: fixed_point64::create_from_rational(0, 1)
+        };
+        event::emit(
+            UnlockScheduleUpdated {
+                pool_address,
+                unlock_numerators,
+                unlock_denominator,
+                unlock_start_time,
+                unlock_duration
+            },
+        );
+    }
+
+    /// Lowers the principle stake of each delegator in `delegators` to the delegator's `active`
+    /// balance in `pool_address` when that balance is below it, and leaves it unchanged otherwise.
+    /// Delegators that hold no principle stake in the pool are skipped. No stake is moved, so stake
+    /// that a delegator unlocked before this call is not locked again.
+    ///
+    /// Aborts if the pool's `cumulative_unlocked_fraction` is not zero. After
+    /// `reset_unlocking_schedule`, the fraction stays zero until the new start time has passed and
+    /// `can_principle_unlock` runs for a principle stakeholder, so this function is to be called
+    /// before the new start time.
+    ///
+    /// This function exists to enable The Supra Foundation to lock principle stake again. It will be
+    /// deactivated before the validator set is opened up to external validator-owners.
+    public entry fun cap_principle_stakes(
+        multisig_admin: &signer,
+        pool_address: address,
+        delegators: vector<address>
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert!(
+            is_admin(signer::address_of(multisig_admin), pool_address),
+            error::permission_denied(ENOT_AUTHORIZED),
+        );
+
+        // Measure each `active` balance as `unlock` does, after synchronizing with the stake pool.
+        synchronize_delegation_pool(pool_address);
+
+        let pool = borrow_global_mut<DelegationPool>(pool_address);
+        assert!(
+            fixed_point64::is_zero(
+                pool.principle_unlock_schedule.cumulative_unlocked_fraction
+            ),
+            error::invalid_state(EUNLOCKING_ALREADY_STARTED),
+        );
+
+        vector::for_each(
+            delegators,
+            |delegator| {
+                if (table::contains(&pool.principle_stake, delegator)) {
+                    let active = pool_u64::balance(&pool.active_shares, delegator);
+                    let principle_stake = table::borrow_mut(
+                        &mut pool.principle_stake, delegator
+                    );
+                    if (active < *principle_stake) {
+                        *principle_stake = active;
+                        event::emit(
+                            UnlockScheduleApplied { pool_address, delegator, amount: active }
+                        );
+                    };
+                };
+            },
+        );
     }
 
     // All sanity checks for unlock schedule parameters in one common function
@@ -10095,6 +10206,176 @@ module supra_framework::pbo_delegation_pool {
         );
         assert!(unlock_coin, 13);
 
+    }
+
+    #[test_only]
+    /// Creates a pool without rewards in which `delegator` holds 100 SUPRA and `@0x020` holds
+    /// 200 SUPRA of principle stake, unlocks the whole principle stake, and has `delegator` unlock
+    /// 30 SUPRA. Returns the pool address and its multisig admin.
+    fun setup_pool_with_unlocked_principle_stake(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ): (address, address) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        initialize_for_test_no_reward(supra_framework);
+        account::create_account_for_test(signer::address_of(validator));
+        let delegator_address = signer::address_of(delegator);
+        let multisig = generate_multisig_account(validator, vector[@0x12134], 2);
+        initialize_test_validator(
+            validator,
+            0,
+            true,
+            true,
+            0,
+            vector[delegator_address, @0x020],
+            vector[100 * ONE_SUPRA, 200 * ONE_SUPRA],
+            stake::mint_coins(300 * ONE_SUPRA),
+            option::some(multisig),
+            vector[100],
+            100,
+            LOCKUP_CYCLE_SECONDS,
+            1,
+        );
+        let pool_address = get_owned_pool_address(signer::address_of(validator));
+
+        timestamp::fast_forward_seconds(2 * LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        unlock(delegator, pool_address, 30 * ONE_SUPRA);
+        let (_, _, _, _, cumulative_unlocked_fraction) = get_unlock_schedule(pool_address);
+        assert!(
+            fixed_point64::equal(
+                cumulative_unlocked_fraction, fixed_point64::create_from_rational(1, 1)
+            ),
+            0,
+        );
+        (pool_address, multisig)
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    public entry fun test_reset_unlocking_schedule_and_cap_principle_stakes(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, multisig) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        let delegator_address = signer::address_of(delegator);
+        let admin = account::create_signer_for_test(multisig);
+        let new_start_time = timestamp::now_seconds() + LOCKUP_CYCLE_SECONDS;
+
+        reset_unlocking_schedule(&admin, pool_address, vector[100], 100, new_start_time, 1);
+        let (_, start_time, _, last_unlock_period, cumulative_unlocked_fraction) =
+            get_unlock_schedule(pool_address);
+        assert!(start_time == new_start_time, 1);
+        assert!(last_unlock_period == 0, 2);
+        assert!(fixed_point64::is_zero(cumulative_unlocked_fraction), 3);
+
+        // `@0x030` holds no principle stake and is skipped.
+        cap_principle_stakes(
+            &admin,
+            pool_address,
+            vector[delegator_address, @0x020, @0x030],
+        );
+        assert!(get_principle_stake(delegator_address, pool_address) == 70 * ONE_SUPRA, 4);
+        assert!(get_principle_stake(@0x020, pool_address) == 200 * ONE_SUPRA, 5);
+        assert!(!is_principle_stakeholder(@0x030, pool_address), 6);
+
+        // The remaining principle stake is locked until the new start time.
+        assert!(!can_principle_unlock(delegator_address, pool_address, 1), 7);
+        assert!(!can_principle_unlock(@0x020, pool_address, 1), 8);
+
+        // The first period of the new schedule ends one second after its start time.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS + 1);
+        assert!(can_principle_unlock(delegator_address, pool_address, 70 * ONE_SUPRA), 9);
+        assert!(can_principle_unlock(@0x020, pool_address, 200 * ONE_SUPRA), 10);
+    }
+
+    // A delegator whose `active` balance is below their principle stake cannot unlock between
+    // `reset_unlocking_schedule` and `cap_principle_stakes`.
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code = 196616, location = Self)]
+    public entry fun test_unlock_after_reset_before_cap_fails(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, multisig) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        reset_unlocking_schedule(
+            &account::create_signer_for_test(multisig),
+            pool_address,
+            vector[100],
+            100,
+            timestamp::now_seconds() + LOCKUP_CYCLE_SECONDS,
+            1,
+        );
+        unlock(delegator, pool_address, 10 * ONE_SUPRA);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code = 65565, location = Self)]
+    public entry fun test_reset_unlocking_schedule_start_not_in_future_fails(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, multisig) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        reset_unlocking_schedule(
+            &account::create_signer_for_test(multisig),
+            pool_address,
+            vector[100],
+            100,
+            timestamp::now_seconds(),
+            1,
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code = 327716, location = Self)]
+    public entry fun test_reset_unlocking_schedule_not_admin_fails(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, _) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        reset_unlocking_schedule(
+            delegator,
+            pool_address,
+            vector[100],
+            100,
+            timestamp::now_seconds() + LOCKUP_CYCLE_SECONDS,
+            1,
+        );
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code = 327716, location = Self)]
+    public entry fun test_cap_principle_stakes_not_admin_fails(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, multisig) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        reset_unlocking_schedule(
+            &account::create_signer_for_test(multisig),
+            pool_address,
+            vector[100],
+            100,
+            timestamp::now_seconds() + LOCKUP_CYCLE_SECONDS,
+            1,
+        );
+        cap_principle_stakes(delegator, pool_address, vector[signer::address_of(delegator)]);
+    }
+
+    #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code = 196649, location = Self)]
+    public entry fun test_cap_principle_stakes_after_unlocking_started_fails(
+        supra_framework: &signer, validator: &signer, delegator: &signer
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        let (pool_address, multisig) = setup_pool_with_unlocked_principle_stake(
+            supra_framework, validator, delegator
+        );
+        cap_principle_stakes(
+            &account::create_signer_for_test(multisig),
+            pool_address,
+            vector[signer::address_of(delegator)],
+        );
     }
 
     #[test(supra_framework = @supra_framework, validator = @0x123, delegator = @0x010)]
